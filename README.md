@@ -259,4 +259,4 @@ python bot.py
 
 > 🤖 **Try it:** [@SkyUpdate_Bot](https://t.me/SkyUpdate_Bot)
 
-*Built across 3 sessions · ~345 DB rows per weather check · 21 insight functions · 15 alert scorers · No ML, no external AI*
+*Built across sussions and cllimates😉"
