@@ -260,3 +260,4 @@ python bot.py
 > 🤖 **Try it:** [@SkyUpdate_Bot](https://t.me/SkyUpdate_Bot)
 
 *Built across sussions and cllimates😉"
+Source is closed only for usage. Sorry!
