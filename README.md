@@ -1,4 +1,4 @@
-# ☁️ SkyUpdate — Personal Weather Intelligence Bot
+# ☁️ SkyUpdate — Weather Intelligence Bot
 
 ### 🤖 Try it live → [@SkyUpdate_Bot](https://t.me/SkyUpdate_Bot)
 
