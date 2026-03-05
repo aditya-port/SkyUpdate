@@ -229,9 +229,6 @@ Because `user_activity` logs every action and `daily_weather` accumulates over t
 pip install python-telegram-bot asyncpg aiohttp beautifulsoup4 selenium python-dotenv requests
 ```
 
-```env
-BOT_TOKEN=your_telegram_bot_token
-DATABASE_URL=postgresql://user:password@localhost:5432/skyupdate
 ```
 
 ```bash
