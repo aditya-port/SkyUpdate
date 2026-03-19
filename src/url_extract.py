@@ -1,19 +1,3 @@
-"""
-url_extract.py
-──────────────
-Finds the weather.com today URL for a given place using ddgs.
-No browser, no API key. Works on any cloud platform.
-
-Install: pip install ddgs
-
-Logic:
-    1. Search DDG for weather.com today URL
-    2. Validate: URL must contain /weather/today/
-    3. Normalise: always inject en-IN into the URL
-       weather.com/weather/today/  → weather.com/en-IN/weather/today/
-       weather.com/az-AZ/weather/  → weather.com/en-IN/weather/today/
-"""
-
 import re
 from ddgs import DDGS
 
@@ -92,6 +76,6 @@ def get_weather_url(place: str) -> str:
     # Take first valid result and normalise to en-IN
     raw = urls[0]
     final = _normalise(raw)
-    print(f"[URLExtract] Raw:   {raw}")
+    # print(f"[URLExtract] Raw:   {raw}")
     print(f"[URLExtract] Final: {final}")
     return final
