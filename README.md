@@ -1,4 +1,4 @@
-# ☁️ SkyUpdate — Personal Weather Intelligence Bot
+# ☁️ SkyUpdate — Weather Intelligence Bot
 
 ### 🤖 Try it live → [@SkyUpdate_Bot](https://t.me/SkyUpdate_Bot)
 
@@ -229,9 +229,6 @@ Because `user_activity` logs every action and `daily_weather` accumulates over t
 pip install python-telegram-bot asyncpg aiohttp beautifulsoup4 selenium python-dotenv requests
 ```
 
-```env
-BOT_TOKEN=your_telegram_bot_token
-DATABASE_URL=postgresql://user:password@localhost:5432/skyupdate
 ```
 
 ```bash
@@ -259,4 +256,5 @@ python bot.py
 
 > 🤖 **Try it:** [@SkyUpdate_Bot](https://t.me/SkyUpdate_Bot)
 
-*Built across 3 sessions · ~345 DB rows per weather check · 21 insight functions · 15 alert scorers · No ML, no external AI*
+*Built across sussions and cllimates😉"
+Source is closed only for usage. Sorry!
