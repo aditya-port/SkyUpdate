@@ -1,13 +1,13 @@
 """
 welcome_card.py
 ───────────────
-Generates an animated GIF welcome card for new SkyUpdate users.
-Returns a BytesIO buffer ready for bot.reply_animation().
+Generates a static PNG welcome card for new SkyUpdate users.
+Returns a BytesIO buffer ready for bot.reply_photo().
 
 Usage:
     from welcome_card import build_welcome_card
     buf = build_welcome_card("Aditya")
-    await update.message.reply_animation(animation=buf)
+    await update.message.reply_photo(photo=buf)
 
 Requires: Pillow (already in requirements.txt)
 Fonts:    uses Poppins from src/fonts/
@@ -17,7 +17,6 @@ from PIL import Image, ImageDraw, ImageFont
 from io import BytesIO
 import os
 import math
-import random
 
 # ── Font resolution ───────────────────────────────────────────────────────────
 _BASE_DIR  = os.path.dirname(os.path.abspath(__file__))
@@ -59,24 +58,7 @@ STAR_C     = (255, 209, 102)
 WAND_C     = (200, 160, 64)
 FEET_C     = (245, 166, 35)
 
-W, H        = 680, 240
-FRAMES      = 36
-FRAME_MS    = 55
-BLINK_START = 28
-BLINK_END   = 32
-
-# ── Fixed snowflake seeds ─────────────────────────────────────────────────────
-random.seed(42)
-FLAKES = [
-    {
-        "x":     random.randint(280, 670),
-        "speed": random.uniform(4.5, 8.0),
-        "r":     random.uniform(1.8, 3.2),
-        "phase": random.uniform(0, FRAMES),
-        "drift": random.uniform(-0.4, 0.4),
-    }
-    for _ in range(22)
-]
+W, H = 680, 240
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -117,35 +99,25 @@ def _draw_bg(draw):
 # ── Text ──────────────────────────────────────────────────────────────────────
 def _draw_text(draw, name):
     tx = 415
-    fl  = _f(_MED,  12)
-    fg  = _f(_BOLD, 36)
-    fs  = _f(_MED,  14)
-    ff  = _f(_REG,  13)
-    fh  = _f(_LT,   11)
+    fl = _f(_MED,  12)
+    fg = _f(_BOLD, 36)
+    fs = _f(_MED,  14)
+    ff = _f(_REG,  13)
+    fh = _f(_LT,   11)
     draw.text((tx, 42),  "SKYUPDATE",                        font=fl, fill=TEXT_LBL,   anchor="mm")
     draw.text((tx, 84),  f"Hey, {name}!",                   font=fg, fill=TEXT_DARK,  anchor="mm")
     draw.text((tx, 112), "Your personal weather companion",  font=fs, fill=TEXT_MID,   anchor="mm")
     draw.line([(338,126),(492,126)], fill=DIVIDER, width=1)
-    for i, txt in enumerate(["☁  Weather + AQI","💡  Daily insights"]):
+    for i, txt in enumerate(["☁  Weather + AQI", "💡  Daily insights"]):
         draw.text((310, 144+i*22), txt, font=ff, fill=TEXT_DARK, anchor="lm")
-    for i, txt in enumerate(["⏰  Morning alerts","📍  Saved locations"]):
+    for i, txt in enumerate(["⏰  Morning alerts", "📍  Saved locations"]):
         draw.text((428, 144+i*22), txt, font=ff, fill=TEXT_DARK, anchor="lm")
     draw.text((tx, 212), "Share your location below to begin", font=fh, fill=TEXT_LIGHT, anchor="mm")
 
 
-# ── Snowflakes ────────────────────────────────────────────────────────────────
-def _draw_snow(draw, frame):
-    for flake in FLAKES:
-        y = ((flake["phase"] + frame * flake["speed"]) % (H + 20)) - 10
-        x = flake["x"] + flake["drift"] * frame
-        _ci(draw, round(x), round(y), round(flake["r"]), SNOW_W)
-
-
 # ── Penguin ───────────────────────────────────────────────────────────────────
-def _draw_penguin(draw, frame):
+def _draw_penguin(draw):
     cx, cy = 148, 200
-    t = frame / FRAMES
-    wave = math.sin(t * 2 * math.pi)
 
     # Snow mound
     _el(draw, cx, 230, 112, 30, SNOW_GND)
@@ -160,18 +132,11 @@ def _draw_penguin(draw, frame):
     _ci(draw, cx, hcy, 34, PEN_BK)
     _el(draw, cx, hcy + 4, 21, 19, PEN_WH)
 
-    # Eyes with blink
-    eye_sy = 1.0
-    if BLINK_START <= frame <= BLINK_END:
-        p = (frame - BLINK_START) / (BLINK_END - BLINK_START)
-        eye_sy = max(0.08, 1.0 - math.sin(p * math.pi) * 0.92)
-
+    # Eyes
     for ex, ey in [(cx-11, hcy-4), (cx+11, hcy-4)]:
         _ci(draw, ex, ey, 8, SNOW_W)
-        ry = max(1, round(5 * eye_sy))
-        _el(draw, ex+1, ey+1, 4, ry, PEN_BK)
-        if eye_sy > 0.3:
-            _ci(draw, ex-1, ey-1, 2, SNOW_W)
+        _el(draw, ex+1, ey+1, 4, 5, PEN_BK)
+        _ci(draw, ex-1, ey-1, 2, SNOW_W)
 
     # Beak
     bky = hcy + 10
@@ -181,46 +146,22 @@ def _draw_penguin(draw, frame):
     for bx in [cx-18, cx+18]:
         _el(draw, bx, hcy+6, 8, 4, (*BLUSH_C, 110))
 
-    # Scarf base
+    # Scarf
     _rr(draw, cx-42, cy-30, 84, 12, 6, SCARF_R)
-
-    # Flying scarf tail
-    cp_x  = cx - 36 + wave * 10
-    cp_y  = cy - 18 + 16 + wave * 4
-    end_x = cx - 32 + wave * 14
-    end_y = cy - 18 + 32 + wave * 6
-    end2x = end_x + wave * 6
-    end2y = end_y + 14
-    draw.line([(cx-36, cy-18), (cp_x, cp_y), (end_x, end_y)],
+    draw.line([(cx-36, cy-18), (cx-38, cy-4), (cx-34, cy+10)],
               fill=SCARF_R, width=7)
-    draw.line([(end_x, end_y), (end2x, end2y)],
+    draw.line([(cx-34, cy+10), (cx-32, cy+22)],
               fill=SCARF_D, width=6)
 
     # Left wing
     _el(draw, cx-40, cy-4, 13, 20, PEN_BK)
 
-    # Right wing waving
-    wa = math.radians(wave * 22)
-    wx = cx + 36 + math.cos(wa) * 6
-    wy = cy - 14
-    draw.ellipse([wx-5, wy-18, wx+19, wy+6], fill=PEN_BK)
-
-    # Wand
-    wx1 = cx + 48 + wave * 5
-    wy1 = cy - 22 + wave * 3
-    wx2 = cx + 68 + wave * 7
-    wy2 = cy - 58 + wave * 4
-    draw.line([(wx1,wy1),(wx2,wy2)], fill=WAND_C, width=3)
-
-    # Star at wand tip
-    sp = 1.0 + 0.25 * math.sin(t * 4 * math.pi)
-    _star(draw, wx2, wy2-10, round(9*sp), STAR_C)
-
-    # Sparkles
-    for i,(ox,oy,br) in enumerate([(14,-6,3.5),(-10,-8,2.5),(12,6,2.8),(-4,-14,2)]):
-        phase = t * 2 * math.pi + i * 1.5
-        r = max(0.5, br * abs(math.sin(phase)))
-        _ci(draw, round(wx2+ox), round(wy2-10+oy), round(r), STAR_C)
+    # Right wing + wand
+    draw.ellipse([cx+31, cy-32, cx+55, cy+8], fill=PEN_BK)
+    draw.line([(cx+50, cy-22), (cx+70, cy-58)], fill=WAND_C, width=3)
+    _star(draw, cx+70, cy-68, 9, STAR_C)
+    for ox, oy, r in [(14,-6,3),(-10,-8,2),(12,6,2)]:
+        _ci(draw, cx+70+ox, cy-68+oy, r, STAR_C)
 
     # Feet
     _el(draw, cx-14, cy+36, 13, 6, FEET_C)
@@ -236,32 +177,21 @@ def _draw_border(draw):
 # ── Public API ────────────────────────────────────────────────────────────────
 def build_welcome_card(first_name: str) -> BytesIO:
     """
-    Builds an animated GIF welcome card.
-    Returns BytesIO — pass directly to reply_animation().
+    Builds a static PNG welcome card.
+    Returns BytesIO — pass directly to reply_photo().
     """
-    name   = (first_name or "there").strip().title()
-    frames = []
+    name = (first_name or "there").strip().title()
 
-    for f_idx in range(FRAMES):
-        img  = Image.new("RGB", (W, H), SKY_TOP)
-        draw = ImageDraw.Draw(img)
-        _draw_bg(draw)
-        _draw_snow(draw, f_idx)
-        _draw_text(draw, name)
-        _draw_penguin(draw, f_idx)
-        _draw_border(draw)
-        frames.append(img.convert("P", palette=Image.ADAPTIVE, colors=128))
+    img  = Image.new("RGB", (W, H), SKY_TOP)
+    draw = ImageDraw.Draw(img)
+
+    _draw_bg(draw)
+    _draw_text(draw, name)
+    _draw_penguin(draw)
+    _draw_border(draw)
 
     buf = BytesIO()
-    frames[0].save(
-        buf,
-        format="GIF",
-        save_all=True,
-        append_images=frames[1:],
-        duration=FRAME_MS,
-        loop=0,
-        optimize=False,
-    )
+    img.save(buf, format="PNG", optimize=True)
     buf.seek(0)
     return buf
 
@@ -269,7 +199,7 @@ def build_welcome_card(first_name: str) -> BytesIO:
 if __name__ == "__main__":
     print("Generating welcome card...")
     buf = build_welcome_card("Aditya")
-    out = os.path.join(_BASE_DIR, "welcome_preview.gif")
+    out = os.path.join(_BASE_DIR, "welcome_preview.png")
     with open(out, "wb") as f:
         f.write(buf.read())
     print(f"Saved → {out}")

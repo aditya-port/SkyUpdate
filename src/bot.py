@@ -1305,7 +1305,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             from welcome_card import build_welcome_card
             buf = build_welcome_card(user.first_name or "there")
-            await update.message.reply_animation(animation=buf)
+            await update.message.reply_photo(photo=buf)
         except Exception as e:
             print(f"[ERROR - welcome card] {e}")
             # Card failed — skip silently, don't crash
