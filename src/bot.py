@@ -1283,11 +1283,27 @@ async def _send_main_menu(target, user_id: int, parse_mode: str = "Markdown"):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user  = update.effective_user
     await log_activity(user, "start")
+
+    # Check if brand new user BEFORE upserting
+    conn = await asyncpg.connect(DATABASE_URL, ssl="require")
+    try:
+        row = await conn.fetchrow(
+            "SELECT user_id FROM users WHERE user_id = $1", user.id
+        )
+        is_new = row is None
+    finally:
+        await conn.close()
+
     await upsert_customer(user)
+
+    # Send welcome card only on first ever /start
+    if is_new:
+        from welcome_card import build_welcome_card
+        buf = build_welcome_card(user.first_name or "there")
+        await update.message.reply_photo(photo=buf)
 
     await _send_main_menu(update.message, user.id)
     await update.message.reply_text("👇 Use the button below anytime.", reply_markup=build_main_keyboard())
-
 
 async def sharelocation_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Sends a one-time location request button."""
