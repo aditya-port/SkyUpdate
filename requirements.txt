@@ -1,6 +1,6 @@
 python-telegram-bot[job-queue]==21.9
 asyncpg==0.30.0
-psycopg2-binary==2.9.9
+psycopg2-binary==2.9.10
 requests==2.31.0
 beautifulsoup4==4.12.3
 Pillow==10.4.0
