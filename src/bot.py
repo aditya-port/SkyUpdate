@@ -42,6 +42,22 @@ load_dotenv()  # loads .env from project root (src/.env)
 BOT_TOKEN    = os.getenv("BOT_TOKEN")
 DATABASE_URL = os.getenv("DATABASE_URL")
 
+# ── Connection pool — reused across all DB calls, avoids per-request connect ──
+_pool = None
+
+async def get_pool():
+    """Returns the shared asyncpg pool, creating it on first call."""
+    global _pool
+    if _pool is None:
+        _pool = await asyncpg.create_pool(
+            DATABASE_URL,
+            ssl="require",
+            min_size=2,
+            max_size=10,
+        )
+    return _pool
+
+
 # ── Conversation states ───────────────────────────────────────────────────────
 NICKNAME_WAITING  = 1   # Waiting for user to type a saved-location nickname
 EVENT_NAME_WAITING = 2  # Waiting for event name in /remind flow
@@ -267,8 +283,7 @@ async def log_activity(user, action: str, detail: str = "", area: str = "",
                        lat=None, lon=None, url_requested=None,
                        session_id=None, condition=None):
     try:
-        conn = await asyncpg.connect(DATABASE_URL, ssl="require")
-        try:
+        async with (await get_pool()).acquire() as conn:
             await conn.execute(
                 """
                 INSERT INTO user_activity
@@ -282,16 +297,13 @@ async def log_activity(user, action: str, detail: str = "", area: str = "",
                 action, detail, area, lat, lon,
                 url_requested, session_id, condition,
             )
-        finally:
-            await conn.close()
     except Exception as e:
         print(f"[DB ERROR - activity] {e}")
 
 
 async def upsert_customer(user):
     try:
-        conn = await asyncpg.connect(DATABASE_URL, ssl="require")
-        try:
+        async with (await get_pool()).acquire() as conn:
             await conn.execute(
                 """
                 INSERT INTO users
@@ -308,16 +320,13 @@ async def upsert_customer(user):
                 user.id, user.username, user.first_name, user.last_name,
                 user.language_code, user.is_premium or False, user.is_bot,
             )
-        finally:
-            await conn.close()
     except Exception as e:
         print(f"[DB ERROR - users] {e}")
 
 
 async def increment_weather_count(user_id: int):
     """Increments weather_checks and successful_runs. Returns the new successful_runs count."""
-    conn = await asyncpg.connect(DATABASE_URL, ssl="require")
-    try:
+    async with (await get_pool()).acquire() as conn:
         row = await conn.fetchrow(
             """
             UPDATE users
@@ -329,15 +338,12 @@ async def increment_weather_count(user_id: int):
             user_id,
         )
         return row["successful_runs"] if row else 0
-    finally:
-        await conn.close()
 
 
 async def get_latest_run(user_id: int):
     """Returns the most recent scraper run row (run_id, weather_code, area)."""
     try:
-        conn = await asyncpg.connect(DATABASE_URL, ssl="require")
-        try:
+        async with (await get_pool()).acquire() as conn:
             row = await conn.fetchrow(
                 """
                 SELECT sr.id AS run_id, cw.weather_code, sr.area
@@ -350,8 +356,6 @@ async def get_latest_run(user_id: int):
                 user_id,
             )
             return row
-        finally:
-            await conn.close()
     except Exception as e:
         print(f"[DB ERROR - get_latest_run] {e}")
         return None
@@ -368,16 +372,13 @@ async def get_weather_code_for_run(run_id: int) -> str | None:
     import asyncio
     for attempt in range(2):
         try:
-            conn = await asyncpg.connect(DATABASE_URL, ssl="require")
-            try:
+            async with (await get_pool()).acquire() as conn:
                 row = await conn.fetchrow(
                     "SELECT weather_code FROM current_weather WHERE run_id = $1 LIMIT 1",
                     run_id,
                 )
                 if row and row["weather_code"] is not None:
                     return WMO_CONDITION.get(row["weather_code"])
-            finally:
-                await conn.close()
         except Exception as e:
             print(f"[DB ERROR - get_weather_code_for_run attempt={attempt}] {e}")
         if attempt == 0:
@@ -388,8 +389,7 @@ async def get_weather_code_for_run(run_id: int) -> str | None:
 async def get_user_last_area(user_id: int):
     """Returns the area string from the most recent scraper run for this user."""
     try:
-        conn = await asyncpg.connect(DATABASE_URL, ssl="require")
-        try:
+        async with (await get_pool()).acquire() as conn:
             row = await conn.fetchrow(
                 """
                 SELECT area FROM scraper_runs
@@ -400,8 +400,6 @@ async def get_user_last_area(user_id: int):
                 user_id,
             )
             return row["area"] if row else None
-        finally:
-            await conn.close()
     except Exception as e:
         print(f"[DB ERROR - get_user_last_area] {e}")
         return None
@@ -444,8 +442,7 @@ async def read_weather_db(user_id: int) -> str:
         try: return val.strftime("%I:%M %p").lstrip("0")
         except Exception: return str(val)
 
-    conn = await asyncpg.connect(DATABASE_URL, ssl="require")
-    try:
+    async with (await get_pool()).acquire() as conn:
         scraped = await conn.fetchrow(
             """
             SELECT ws.feels_like, ws.condition, ws.high, ws.low,
@@ -506,8 +503,6 @@ async def read_weather_db(user_id: int) -> str:
             run_id, today,
         )
 
-    finally:
-        await conn.close()
 
     # ── Current temp ──────────────────────────────────────────────────────────
     curr_temp = None
@@ -658,8 +653,7 @@ async def read_weather_db(user_id: int) -> str:
 async def save_location(user_id: int, nickname: str, area: str,
                         lat: float, lon: float, url: str):
     try:
-        conn = await asyncpg.connect(DATABASE_URL, ssl="require")
-        try:
+        async with (await get_pool()).acquire() as conn:
             count = await conn.fetchval(
                 "SELECT COUNT(*) FROM saved_locations WHERE user_id = $1", user_id
             )
@@ -673,16 +667,13 @@ async def save_location(user_id: int, nickname: str, area: str,
                 """,
                 user_id, nickname, area, lat, lon, url, is_default,
             )
-        finally:
-            await conn.close()
     except Exception as e:
         print(f"[DB ERROR - save_location] {e}")
 
 
 async def get_saved_locations(user_id: int):
     try:
-        conn = await asyncpg.connect(DATABASE_URL, ssl="require")
-        try:
+        async with (await get_pool()).acquire() as conn:
             rows = await conn.fetch(
                 """
                 SELECT id, nickname, area, lat, lon, url, is_default
@@ -693,8 +684,6 @@ async def get_saved_locations(user_id: int):
                 user_id,
             )
             return rows
-        finally:
-            await conn.close()
     except Exception as e:
         print(f"[DB ERROR - get_saved_locations] {e}")
         return []
@@ -702,8 +691,7 @@ async def get_saved_locations(user_id: int):
 
 async def log_feedback(user_id: int, run_id: int, feedback: str):
     try:
-        conn = await asyncpg.connect(DATABASE_URL, ssl="require")
-        try:
+        async with (await get_pool()).acquire() as conn:
             await conn.execute(
                 """
                 INSERT INTO insight_feedback (user_id, run_id, feedback)
@@ -711,16 +699,13 @@ async def log_feedback(user_id: int, run_id: int, feedback: str):
                 """,
                 user_id, run_id, feedback,
             )
-        finally:
-            await conn.close()
     except Exception as e:
         print(f"[DB ERROR - log_feedback] {e}")
 
 
 async def get_community_insights(area: str):
     try:
-        conn = await asyncpg.connect(DATABASE_URL, ssl="require")
-        try:
+        async with (await get_pool()).acquire() as conn:
             row = await conn.fetchrow(
                 """
                 SELECT COUNT(DISTINCT user_id) AS user_count,
@@ -738,8 +723,6 @@ async def get_community_insights(area: str):
                     f"— most seeing *{cond}*."
                 )
             return None
-        finally:
-            await conn.close()
     except Exception as e:
         print(f"[DB ERROR - community_insights] {e}")
         return None
@@ -757,14 +740,11 @@ async def maybe_ask_contact(update, context, user_id: int) -> bool:
     other keyboard actions until the user submits or cancels.
     Returns True if the prompt was shown, False otherwise.
     """
-    conn = await asyncpg.connect(DATABASE_URL, ssl="require")
-    try:
+    async with (await get_pool()).acquire() as conn:
         row = await conn.fetchrow(
             "SELECT weather_checks, contact FROM users WHERE user_id = $1",
             user_id,
         )
-    finally:
-        await conn.close()
 
     if not row:
         return False
@@ -796,27 +776,39 @@ async def maybe_ask_contact(update, context, user_id: int) -> bool:
 # CORE WEATHER PIPELINE
 # ─────────────────────────────────────────────────────────────────────────────
 
+# Shared aiohttp session — created once, reused for all HTTP calls
+_http_session = None
+
+async def get_http_session() -> aiohttp.ClientSession:
+    global _http_session
+    if _http_session is None or _http_session.closed:
+        _http_session = aiohttp.ClientSession(
+            headers={"User-Agent": "SkyUpdateBot"},
+            timeout=aiohttp.ClientTimeout(total=10),
+        )
+    return _http_session
+
+
 async def reverse_geocode(lat: float, lon: float):
     """Returns (city, area, state, area_string) from OpenStreetMap Nominatim."""
     url    = "https://nominatim.openstreetmap.org/reverse"
     params = {"lat": lat, "lon": lon, "format": "json", "zoom": 18, "addressdetails": 1}
-    headers = {"User-Agent": "SkyUpdateBot"}
 
-    async with aiohttp.ClientSession() as session:
-        async with session.get(url, params=params, headers=headers) as resp:
-            data = await resp.json()
-            addr = data.get("address", {})
+    session = await get_http_session()
+    async with session.get(url, params=params) as resp:
+        data = await resp.json()
+        addr = data.get("address", {})
 
-            city  = (addr.get("city") or addr.get("town") or addr.get("municipality")
-                     or addr.get("village") or "Unknown")
-            area  = (addr.get("suburb") or addr.get("neighbourhood") or addr.get("quarter")
-                     or addr.get("residential") or addr.get("hamlet") or addr.get("road")
-                     or addr.get("postcode") or "Unknown")
-            state = addr.get("state") or "Unknown"
+        city  = (addr.get("city") or addr.get("town") or addr.get("municipality")
+                 or addr.get("village") or "Unknown")
+        area  = (addr.get("suburb") or addr.get("neighbourhood") or addr.get("quarter")
+                 or addr.get("residential") or addr.get("hamlet") or addr.get("road")
+                 or addr.get("postcode") or "Unknown")
+        state = addr.get("state") or "Unknown"
 
-            parts       = [p for p in [city, area, state] if p and p != "Unknown"]
-            area_string = ", ".join(parts)
-            return city, area, state, area_string
+        parts       = [p for p in [city, area, state] if p and p != "Unknown"]
+        area_string = ", ".join(parts)
+        return city, area, state, area_string
 
 
 async def fetch_and_store_weather(user_id: int, lat: float, lon: float,
@@ -825,8 +817,7 @@ async def fetch_and_store_weather(user_id: int, lat: float, lon: float,
     Cache check (30 min, weather.com only) → URL extraction → scraper run.
     Returns the URL string or "cached" if cache hit.
     """
-    conn = await asyncpg.connect(DATABASE_URL, ssl="require")
-    try:
+    async with (await get_pool()).acquire() as conn:
         cache_row = await conn.fetchrow(
             """
             SELECT timestamp FROM weather_scraped
@@ -841,8 +832,6 @@ async def fetch_and_store_weather(user_id: int, lat: float, lon: float,
         if cache_row:
             print(f"[{user_id}] Cache hit — skipping pipeline")
             return "cached"
-    finally:
-        await conn.close()
 
     print(f"[{user_id}] Cache miss — running pipeline")
     url = await asyncio.to_thread(get_weather_url, area_string)
@@ -852,14 +841,12 @@ async def fetch_and_store_weather(user_id: int, lat: float, lon: float,
 
 async def _get_user_output_mode(user_id: int) -> str:
     """Returns 'visual' or 'text' based on users.output_mode. Defaults to visual."""
-    conn = await asyncpg.connect(DATABASE_URL, ssl="require")
     try:
-        row = await conn.fetchrow("SELECT output_mode FROM users WHERE user_id = $1", user_id)
-        return (row["output_mode"] or "visual") if row else "visual"
+        async with (await get_pool()).acquire() as conn:
+            row = await conn.fetchrow("SELECT output_mode FROM users WHERE user_id = $1", user_id)
+            return (row["output_mode"] or "visual") if row else "visual"
     except Exception:
         return "visual"
-    finally:
-        await conn.close()
 
 
 
@@ -896,8 +883,7 @@ async def build_weather_message(user_id: int, area_string: str, nickname: str = 
     short_area   = area_string.split(",")[0].strip()
     display_area = nickname if nickname else short_area
 
-    conn = await asyncpg.connect(DATABASE_URL, ssl="require")
-    try:
+    async with (await get_pool()).acquire() as conn:
         scraped = await conn.fetchrow(
             """
             SELECT ws.feels_like, ws.condition, ws.high, ws.low,
@@ -909,10 +895,11 @@ async def build_weather_message(user_id: int, area_string: str, nickname: str = 
             FROM weather_scraped ws
             JOIN scraper_runs sr ON sr.id = ws.run_id
             WHERE ws.user_id = $1
+              AND sr.area = $2
             ORDER BY ws.timestamp DESC
             LIMIT 1
             """,
-            user_id,
+            user_id, area_string,
         )
         if not scraped:
             # Fallback to text if no data
@@ -926,7 +913,8 @@ async def build_weather_message(user_id: int, area_string: str, nickname: str = 
 
         current = await conn.fetchrow(
             """SELECT temperature_2m, relative_humidity_2m, wind_speed_10m,
-                      wind_gusts_10m, wind_direction_10m, uv_index, is_day
+                      wind_gusts_10m, wind_direction_10m, uv_index, is_day,
+                      us_aqi, scraped_aqi_value, scraped_aqi_category
                FROM current_weather WHERE run_id = $1 LIMIT 1""",
             rid,
         )
@@ -951,8 +939,6 @@ async def build_weather_message(user_id: int, area_string: str, nickname: str = 
                FROM weather_scraped WHERE run_id = $1 LIMIT 1""",
             rid,
         )
-    finally:
-        await conn.close()
 
     def deg_to_compass(deg):
         if deg is None: return ""
@@ -995,19 +981,26 @@ async def build_weather_message(user_id: int, area_string: str, nickname: str = 
         if daily.get("wind_gusts_10m_max"):
             wind_gusts = round(daily["wind_gusts_10m_max"])
 
-    # UV
-    uv = None
-    if current and current.get("uv_index") is not None and current.get("is_day", 0) == 1:
-        uv = round(current["uv_index"])
-    elif daily and daily.get("uv_index_max") is not None:
-        uv = round(daily["uv_index_max"])
+    # UV — raw text directly from weather_scraped.uv_index (weather.com)
+    uv = scraped.get("uv_index") or None
 
-    # AQI
+    # AQI — use scraped_aqi_value from current_weather (weather.com primary)
+    # fallback to us_aqi from Open-Meteo if scraper missed it
     aqi, aqi_cat = None, ""
-    if scraped["aqi_value"]:
+    cw_scraped_val = current.get("scraped_aqi_value") if current else None
+    cw_scraped_cat = current.get("scraped_aqi_category") if current else None
+    if cw_scraped_val:
+        try: aqi = round(float(cw_scraped_val))
+        except Exception: pass
+        aqi_cat = cw_scraped_cat or ""
+    if aqi is None and current and current.get("us_aqi") is not None:
+        try: aqi = round(float(current["us_aqi"]))
+        except Exception: pass
+        aqi_cat = scraped.get("aqi_category") or ""
+    if aqi is None and scraped["aqi_value"]:
         try: aqi = round(float(scraped["aqi_value"]))
         except Exception: pass
-    aqi_cat = scraped.get("aqi_category") or ""
+        aqi_cat = scraped.get("aqi_category") or ""
 
     # Rain
     rain_chance, rain_mm = None, None
@@ -1150,8 +1143,7 @@ async def _store_insight_history(user_id: int, area: str, triggered_tiers: list)
     Used to detect multi-day streaks (e.g. bad AQI 4 days in a row).
     """
     try:
-        conn = await asyncpg.connect(DATABASE_URL, ssl="require")
-        try:
+        async with (await get_pool()).acquire() as conn:
             import json as _json
             await conn.execute(
                 """
@@ -1162,8 +1154,6 @@ async def _store_insight_history(user_id: int, area: str, triggered_tiers: list)
                 """,
                 user_id, area, _json.dumps(triggered_tiers),
             )
-        finally:
-            await conn.close()
     except Exception as e:
         print(f"[DB ERROR - insight_history] {e}")
 
@@ -1175,8 +1165,7 @@ async def _get_streak_context(user_id: int, area: str, tier: int) -> str:
     Returns "" if no streak.
     """
     try:
-        conn = await asyncpg.connect(DATABASE_URL, ssl="require")
-        try:
+        async with (await get_pool()).acquire() as conn:
             import json as _json
             rows = await conn.fetch(
                 """
@@ -1188,8 +1177,6 @@ async def _get_streak_context(user_id: int, area: str, tier: int) -> str:
                 """,
                 user_id, area,
             )
-        finally:
-            await conn.close()
 
         if len(rows) < 3:
             return ""
@@ -1287,14 +1274,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Check if brand new user BEFORE upserting
     is_new = False
     try:
-        conn = await asyncpg.connect(DATABASE_URL, ssl="require")
-        try:
+        async with (await get_pool()).acquire() as conn:
             row = await conn.fetchrow(
                 "SELECT user_id FROM users WHERE user_id = $1", user.id
             )
             is_new = row is None
-        finally:
-            await conn.close()
     except Exception as e:
         print(f"[DB ERROR - start new user check] {e}")
 
@@ -1338,8 +1322,7 @@ async def savedlocations_command(update: Update, context: ContextTypes.DEFAULT_T
 async def _log_scraper_error(user_id: int, area: str, error_msg: str):
     """Logs scraper failures to scraper_errors table for operational monitoring."""
     try:
-        conn = await asyncpg.connect(DATABASE_URL, ssl="require")
-        try:
+        async with (await get_pool()).acquire() as conn:
             await conn.execute(
                 """
                 INSERT INTO scraper_errors (user_id, area, error_msg, timestamp)
@@ -1347,8 +1330,6 @@ async def _log_scraper_error(user_id: int, area: str, error_msg: str):
                 """,
                 user_id, area, error_msg[:500],
             )
-        finally:
-            await conn.close()
     except Exception as e:
         print(f"[DB ERROR - scraper_errors] {e}")
 
@@ -1359,14 +1340,11 @@ async def _check_rate_limit(user_id: int) -> int:
     Returns 999 if no record exists (first request).
     """
     try:
-        conn = await asyncpg.connect(DATABASE_URL, ssl="require")
-        try:
+        async with (await get_pool()).acquire() as conn:
             row = await conn.fetchrow(
                 "SELECT ran_at FROM scraper_runs WHERE user_id = $1 ORDER BY ran_at DESC LIMIT 1",
                 user_id,
             )
-        finally:
-            await conn.close()
         if not row:
             return 999
         age = (datetime.datetime.now() - row["ran_at"].replace(tzinfo=None)).total_seconds()
@@ -1403,8 +1381,8 @@ async def location_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         run_id    = run_info["run_id"] if run_info else None
         condition = await get_weather_code_for_run(run_id) if run_id else None
 
-        await log_activity(user, "location_shared", area=area_string, lat=lat, lon=lon,
-                           url_requested=url, session_id=session_id, condition=condition)
+        asyncio.create_task(log_activity(user, "location_shared", area=area_string, lat=lat, lon=lon,
+                           url_requested=url, session_id=session_id, condition=condition))
 
         # Replace the waiting message with a simple confirmation — no weather card yet.
         # The user picks what they want to see via the choice keyboard below.
@@ -1546,13 +1524,10 @@ async def _post_choice_prompts_inline(query, context, user):
 
     # Contact check inline — only fires if feedback was NOT shown this turn
     if not showed_something:
-        conn = await asyncpg.connect(DATABASE_URL, ssl="require")
-        try:
+        async with (await get_pool()).acquire() as conn:
             row = await conn.fetchrow(
                 "SELECT weather_checks, contact FROM users WHERE user_id = $1", user.id
             )
-        finally:
-            await conn.close()
 
         if row:
             checks  = row["weather_checks"] or 0
@@ -1617,14 +1592,11 @@ async def log_any_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             # Pass a datetime.time object — required by asyncpg for TIME columns
             alert_t = _dt.time(hour, minute)
-            conn = await asyncpg.connect(DATABASE_URL, ssl="require")
-            try:
+            async with (await get_pool()).acquire() as conn:
                 await conn.execute(
                     "UPDATE users SET alert_time = $1 WHERE user_id = $2",
                     alert_t, user.id,
                 )
-            finally:
-                await conn.close()
             context.user_data["awaiting_alert_time"] = False
             await update.message.reply_text(
                 f"✅ Morning alert set for *{hour:02d}:{minute:02d} AM*.",
@@ -1645,14 +1617,11 @@ async def log_any_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             context.user_data["awaiting_rename_loc_id"] = loc_id
             return
         try:
-            conn = await asyncpg.connect(DATABASE_URL, ssl="require")
-            try:
+            async with (await get_pool()).acquire() as conn:
                 await conn.execute(
                     "UPDATE saved_locations SET nickname = $1 WHERE id = $2 AND user_id = $3",
                     new_nick, loc_id, user.id,
                 )
-            finally:
-                await conn.close()
             await update.message.reply_text(
                 f"✅ Renamed to *{new_nick}*.",
                 parse_mode="Markdown",
@@ -1686,14 +1655,11 @@ async def log_any_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        conn = await asyncpg.connect(DATABASE_URL, ssl="require")
-        try:
+        async with (await get_pool()).acquire() as conn:
             await conn.execute(
                 "UPDATE users SET contact = $1 WHERE user_id = $2",
                 normalized, user.id,
             )
-        finally:
-            await conn.close()
 
         context.user_data["awaiting_contact"] = False
         context.user_data["contact_locked"]   = False
@@ -1748,8 +1714,8 @@ async def log_any_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def insights_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     await update.callback_query.answer("💡 Loading insights…")
-    await upsert_customer(user)
-    await log_activity(user, "insights_button")
+    asyncio.create_task(upsert_customer(user))
+    asyncio.create_task(log_activity(user, "insights_button"))
 
     area = await get_user_last_area(user.id)
     if not area:
@@ -1760,9 +1726,11 @@ async def insights_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         area_label      = f"📍 *{_short_name(area)}*\n\n"
-        visible, hidden = await generate_insights_split(user.id, area)
+        (visible, hidden), bonus = await asyncio.gather(
+            generate_insights_split(user.id, area),
+            generate_bonus_insights(user.id, area),
+        )
         full_insights   = visible + ("\n\n" + hidden if hidden else "")
-        bonus           = await generate_bonus_insights(user.id, area)
         full_text       = area_label + full_insights
         if bonus and not bonus.startswith("✅ Nothing"):
             full_text += "\n\n" + bonus
@@ -2070,9 +2038,11 @@ async def choice_insights_callback(update: Update, context: ContextTypes.DEFAULT
 
     try:
         label           = f"📍 *{_short_name(area_string, nickname)}*"
-        visible, hidden = await generate_insights_split(user.id, area_string)
+        (visible, hidden), bonus = await asyncio.gather(
+            generate_insights_split(user.id, area_string),
+            generate_bonus_insights(user.id, area_string),
+        )
         full_insights   = visible + ("\n\n" + hidden if hidden else "")
-        bonus           = await generate_bonus_insights(user.id, area_string)
         full_text       = f"{label}\n\n{full_insights}"
         if bonus and not bonus.startswith("✅ Nothing"):
             full_text += "\n\n" + bonus
@@ -2148,14 +2118,11 @@ async def load_location_callback(update: Update, context: ContextTypes.DEFAULT_T
     await upsert_customer(user)
 
     try:
-        conn = await asyncpg.connect(DATABASE_URL, ssl="require")
-        try:
+        async with (await get_pool()).acquire() as conn:
             loc = await conn.fetchrow(
                 "SELECT * FROM saved_locations WHERE id = $1 AND user_id = $2",
                 loc_id, user.id,
             )
-        finally:
-            await conn.close()
     except Exception as e:
         print(f"[ERROR - load_location_callback] {e}")
         await update.callback_query.message.reply_text("⚠️ Couldn't load that location.")
@@ -2227,14 +2194,11 @@ async def manage_location_callback(update: Update, context: ContextTypes.DEFAULT
     await query.answer()
 
     try:
-        conn = await asyncpg.connect(DATABASE_URL, ssl="require")
-        try:
+        async with (await get_pool()).acquire() as conn:
             loc = await conn.fetchrow(
                 "SELECT * FROM saved_locations WHERE id = $1 AND user_id = $2",
                 loc_id, user.id,
             )
-        finally:
-            await conn.close()
     except Exception as e:
         print(f"[ERROR - manage_location_callback] {e}")
         await query.message.reply_text("⚠️ Couldn't load that location.")
@@ -2271,8 +2235,7 @@ async def loc_setdefault_callback(update: Update, context: ContextTypes.DEFAULT_
     await query.answer()
 
     try:
-        conn = await asyncpg.connect(DATABASE_URL, ssl="require")
-        try:
+        async with (await get_pool()).acquire() as conn:
             await conn.execute(
                 "UPDATE saved_locations SET is_default = FALSE WHERE user_id = $1", user.id
             )
@@ -2283,8 +2246,6 @@ async def loc_setdefault_callback(update: Update, context: ContextTypes.DEFAULT_
             loc = await conn.fetchrow(
                 "SELECT nickname FROM saved_locations WHERE id = $1", loc_id
             )
-        finally:
-            await conn.close()
         nick = loc["nickname"] if loc else "location"
         await query.message.reply_text(
             f"⭐ *{nick}* is now your default location.",
@@ -2304,8 +2265,7 @@ async def loc_delete_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
     await query.answer()
 
     try:
-        conn = await asyncpg.connect(DATABASE_URL, ssl="require")
-        try:
+        async with (await get_pool()).acquire() as conn:
             loc = await conn.fetchrow(
                 "SELECT nickname FROM saved_locations WHERE id = $1 AND user_id = $2",
                 loc_id, user.id,
@@ -2317,8 +2277,6 @@ async def loc_delete_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
                 "DELETE FROM saved_locations WHERE id = $1 AND user_id = $2",
                 loc_id, user.id,
             )
-        finally:
-            await conn.close()
         await query.message.reply_text(
             f"🗑️ *{loc['nickname']}* deleted.",
             parse_mode="Markdown",
@@ -2337,14 +2295,11 @@ async def loc_rename_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
     await query.answer()
 
     try:
-        conn = await asyncpg.connect(DATABASE_URL, ssl="require")
-        try:
+        async with (await get_pool()).acquire() as conn:
             loc = await conn.fetchrow(
                 "SELECT nickname FROM saved_locations WHERE id = $1 AND user_id = $2",
                 loc_id, user.id,
             )
-        finally:
-            await conn.close()
     except Exception as e:
         print(f"[ERROR - loc_rename] {e}")
         await query.message.reply_text("⚠️ Couldn't load location. Try again.")
@@ -2466,8 +2421,7 @@ async def remind_receive_date(update: Update, context: ContextTypes.DEFAULT_TYPE
     # Get the user's area from their most recent run
     area = await get_user_last_area(user.id)
 
-    conn = await asyncpg.connect(DATABASE_URL, ssl="require")
-    try:
+    async with (await get_pool()).acquire() as conn:
         lat_row = await conn.fetchrow(
             "SELECT lat, lon FROM user_activity WHERE user_id = $1 AND lat IS NOT NULL ORDER BY timestamp DESC LIMIT 1",
             user.id,
@@ -2482,8 +2436,6 @@ async def remind_receive_date(update: Update, context: ContextTypes.DEFAULT_TYPE
             """,
             user.id, event_name, event_date, area, lat, lon,
         )
-    finally:
-        await conn.close()
 
     await update.message.reply_text(
         f"✅ Reminder set! I'll send you a weather forecast for *{event_name}* "
@@ -2507,8 +2459,7 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     await log_activity(user, "stats_command")
 
-    conn = await asyncpg.connect(DATABASE_URL, ssl="require")
-    try:
+    async with (await get_pool()).acquire() as conn:
         # Basic usage stats
         user_row = await conn.fetchrow(
             "SELECT weather_checks, successful_runs FROM users WHERE user_id = $1",
@@ -2551,8 +2502,6 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "SELECT COUNT(*) FROM saved_locations WHERE user_id = $1", user.id
         )
 
-    finally:
-        await conn.close()
 
     checks   = user_row["weather_checks"] if user_row else 0
     runs     = user_row["successful_runs"] if user_row else 0
@@ -2580,14 +2529,11 @@ async def pause_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     await log_activity(user, "pause_alerts")
 
-    conn = await asyncpg.connect(DATABASE_URL, ssl="require")
-    try:
+    async with (await get_pool()).acquire() as conn:
         await conn.execute(
             "UPDATE users SET alerts_enabled = FALSE WHERE user_id = $1",
             user.id,
         )
-    finally:
-        await conn.close()
 
     await update.message.reply_text(
         "🔕 Morning alerts paused. I'll stop sending the 7 AM summary.\n\n"
@@ -2684,14 +2630,11 @@ async def appearance_choice_callback(update: Update, context: ContextTypes.DEFAU
     await query.answer()
     choice = "visual" if query.data == "appearance_visual" else "text"
 
-    conn = await asyncpg.connect(DATABASE_URL, ssl="require")
-    try:
+    async with (await get_pool()).acquire() as conn:
         await conn.execute(
             "UPDATE users SET output_mode = $1 WHERE user_id = $2",
             choice, query.from_user.id,
         )
-    finally:
-        await conn.close()
 
     label   = "🖼️ Visual card" if choice == "visual" else "📝 Text card"
     confirm = "Great choice! Your weather will now be delivered as an image." \
@@ -2702,14 +2645,11 @@ async def appearance_choice_callback(update: Update, context: ContextTypes.DEFAU
 async def resume_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Re-enables morning alerts."""
     user = update.effective_user
-    conn = await asyncpg.connect(DATABASE_URL, ssl="require")
-    try:
+    async with (await get_pool()).acquire() as conn:
         await conn.execute(
             "UPDATE users SET alerts_enabled = TRUE WHERE user_id = $1",
             user.id,
         )
-    finally:
-        await conn.close()
 
     await update.message.reply_text("✅ Morning alerts re-enabled! See you at 7 AM tomorrow.")
 
@@ -2730,9 +2670,11 @@ async def insights_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         area_label      = f"📍 *{_short_name(area)}*\n\n"
-        visible, hidden = await generate_insights_split(user.id, area)
+        (visible, hidden), bonus = await asyncio.gather(
+            generate_insights_split(user.id, area),
+            generate_bonus_insights(user.id, area),
+        )
         full_insights   = visible + ("\n\n" + hidden if hidden else "")
-        bonus           = await generate_bonus_insights(user.id, area)
         full_text       = area_label + full_insights
         if bonus and not bonus.startswith("✅ Nothing"):
             full_text += "\n\n" + bonus
@@ -2769,8 +2711,7 @@ async def send_night_prewarning(context: ContextTypes.DEFAULT_TYPE):
     if not (20 <= now.hour < 21):
         return
 
-    conn = await asyncpg.connect(DATABASE_URL, ssl="require")
-    try:
+    async with (await get_pool()).acquire() as conn:
         users = await conn.fetch(
             """
             SELECT sl.user_id, sl.area
@@ -2785,13 +2726,10 @@ async def send_night_prewarning(context: ContextTypes.DEFAULT_TYPE):
             """,
             today,
         )
-    finally:
-        await conn.close()
 
     for row in users:
         try:
-            conn = await asyncpg.connect(DATABASE_URL, ssl="require")
-            try:
+            async with (await get_pool()).acquire() as conn:
                 run_row = await conn.fetchrow(
                     """SELECT id FROM scraper_runs WHERE user_id = $1
                        ORDER BY ran_at DESC LIMIT 1""",
@@ -2806,8 +2744,6 @@ async def send_night_prewarning(context: ContextTypes.DEFAULT_TYPE):
                        WHERE run_id = $1 AND date = $2 LIMIT 1""",
                     run_row["id"], tomorrow,
                 )
-            finally:
-                await conn.close()
 
             if not danger_rows:
                 continue
@@ -2838,15 +2774,12 @@ async def send_night_prewarning(context: ContextTypes.DEFAULT_TYPE):
                 parse_mode="Markdown",
             )
 
-            log_conn = await asyncpg.connect(DATABASE_URL, ssl="require")
-            try:
+            async with (await get_pool()).acquire() as log_conn:
                 await log_conn.execute(
                     """INSERT INTO alerts_sent (user_id, alert_type, area)
                        VALUES ($1, 'night_prewarning', $2) ON CONFLICT DO NOTHING""",
                     row["user_id"], row["area"],
                 )
-            finally:
-                await log_conn.close()
 
             print(f"[NIGHT PREWARNING] Sent to user {row['user_id']}")
 
@@ -2865,8 +2798,7 @@ async def send_morning_alerts(context: ContextTypes.DEFAULT_TYPE):
     now   = datetime.datetime.now()
     today = datetime.date.today()
 
-    conn  = await asyncpg.connect(DATABASE_URL, ssl="require")
-    try:
+    async with (await get_pool()).acquire() as conn:
         users = await conn.fetch(
             """
             SELECT sl.user_id, sl.area, sl.lat, sl.lon,
@@ -2882,8 +2814,6 @@ async def send_morning_alerts(context: ContextTypes.DEFAULT_TYPE):
             """,
             today,
         )
-    finally:
-        await conn.close()
 
     # Only process users whose alert_time matches the current minute
     due = [
@@ -2920,8 +2850,7 @@ async def send_morning_alerts(context: ContextTypes.DEFAULT_TYPE):
             )
 
             # Log to prevent double-send
-            log_conn = await asyncpg.connect(DATABASE_URL, ssl="require")
-            try:
+            async with (await get_pool()).acquire() as log_conn:
                 await log_conn.execute(
                     """
                     INSERT INTO morning_alerts_log (user_id, alert_date, area)
@@ -2930,8 +2859,6 @@ async def send_morning_alerts(context: ContextTypes.DEFAULT_TYPE):
                     """,
                     row["user_id"], today, row["area"],
                 )
-            finally:
-                await log_conn.close()
 
             print(f"[MORNING ALERT] Sent to user {row['user_id']} ({row['area']})")
 
@@ -2949,8 +2876,7 @@ async def send_rain_proximity_alerts(context: ContextTypes.DEFAULT_TYPE):
     now   = datetime.datetime.now()
     today = datetime.date.today()
 
-    conn = await asyncpg.connect(DATABASE_URL, ssl="require")
-    try:
+    async with (await get_pool()).acquire() as conn:
         users = await conn.fetch(
             """
             SELECT sl.user_id, sl.area
@@ -2960,13 +2886,10 @@ async def send_rain_proximity_alerts(context: ContextTypes.DEFAULT_TYPE):
               AND u.alerts_enabled = TRUE
             """
         )
-    finally:
-        await conn.close()
 
     for row in users:
         try:
-            conn = await asyncpg.connect(DATABASE_URL, ssl="require")
-            try:
+            async with (await get_pool()).acquire() as conn:
                 # Check if rain alert already sent today for this user
                 already_sent = await conn.fetchval(
                     """
@@ -3003,8 +2926,6 @@ async def send_rain_proximity_alerts(context: ContextTypes.DEFAULT_TYPE):
                     """,
                     run_row["id"], now,
                 )
-            finally:
-                await conn.close()
 
             if not rain_rows:
                 continue
@@ -3020,8 +2941,7 @@ async def send_rain_proximity_alerts(context: ContextTypes.DEFAULT_TYPE):
             )
 
             # Log to alerts_sent
-            log_conn = await asyncpg.connect(DATABASE_URL, ssl="require")
-            try:
+            async with (await get_pool()).acquire() as log_conn:
                 await log_conn.execute(
                     """
                     INSERT INTO alerts_sent (user_id, alert_type, area)
@@ -3030,8 +2950,6 @@ async def send_rain_proximity_alerts(context: ContextTypes.DEFAULT_TYPE):
                     """,
                     row["user_id"], row["area"],
                 )
-            finally:
-                await log_conn.close()
 
             print(f"[RAIN ALERT] Sent to user {row['user_id']} ({row['area']})")
 
@@ -3049,8 +2967,7 @@ async def send_event_reminders(context: ContextTypes.DEFAULT_TYPE):
     today    = datetime.date.today()
     tomorrow = today + datetime.timedelta(days=1)
 
-    conn = await asyncpg.connect(DATABASE_URL, ssl="require")
-    try:
+    async with (await get_pool()).acquire() as conn:
         # Day-before reminders — event is tomorrow, not yet sent
         day_before_events = await conn.fetch(
             """
@@ -3070,8 +2987,6 @@ async def send_event_reminders(context: ContextTypes.DEFAULT_TYPE):
             """,
             today,
         )
-    finally:
-        await conn.close()
 
     # ── Day-before: send tomorrow's forecast ─────────────────────────────
     for event in day_before_events:
@@ -3103,13 +3018,10 @@ async def send_event_reminders(context: ContextTypes.DEFAULT_TYPE):
             )
 
             # Mark as fully sent now that both messages have gone out
-            update_conn = await asyncpg.connect(DATABASE_URL, ssl="require")
-            try:
+            async with (await get_pool()).acquire() as update_conn:
                 await update_conn.execute(
                     "UPDATE event_reminders SET sent = TRUE WHERE id = $1", event["id"]
                 )
-            finally:
-                await update_conn.close()
 
             print(f"[EVENT ON-DAY] Sent to user {event['user_id']} for {event['event_name']}")
 
@@ -3126,8 +3038,7 @@ async def send_weekly_digest(context: ContextTypes.DEFAULT_TYPE):
     today      = datetime.date.today()
     week_start = today - datetime.timedelta(days=today.weekday())
 
-    conn = await asyncpg.connect(DATABASE_URL, ssl="require")
-    try:
+    async with (await get_pool()).acquire() as conn:
         users = await conn.fetch(
             """
             SELECT sl.user_id, sl.area
@@ -3211,8 +3122,6 @@ async def send_weekly_digest(context: ContextTypes.DEFAULT_TYPE):
             except Exception as e:
                 print(f"[ERROR - weekly_digest user={row['user_id']}] {e}")
 
-    finally:
-        await conn.close()
 
 
 # ─────────────────────────────────────────────────────────────────────────────

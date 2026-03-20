@@ -60,10 +60,14 @@ def _aqi_col(v):
 
 def _uv_col(v):
     if v is None: return MUTED
-    if v <= 2:    return GREEN
-    if v <= 5:    return YELLOW
-    if v <= 7:    return ORANGE
-    return RED
+    try:
+        n = float(str(v).split()[0])
+        if n <= 2: return GREEN
+        if n <= 5: return YELLOW
+        if n <= 7: return ORANGE
+        return RED
+    except Exception:
+        return MUTED
 
 def _pill(draw, x, y, w, h, fill, r=14):
     draw.rounded_rectangle([x, y, x+w, y+h], radius=r, fill=fill)
@@ -308,8 +312,21 @@ def build_weather_card(data: dict) -> BytesIO:
 
     # Moon phase
     if moon_phase:
+        _MOON_PCT = {
+            "new moon":              0,
+            "waxing crescent":      12,
+            "first quarter":        25,
+            "waxing gibbous":       62,
+            "full moon":           100,
+            "waning gibbous":       75,
+            "last quarter":         25,
+            "third quarter":        25,
+            "waning crescent":      12,
+        }
+        pct = _MOON_PCT.get(moon_phase.lower().strip())
+        pct_str = f"  {pct}%" if pct is not None else ""
         _moon_icon(draw, PAD+10, y+13, r=10)
-        draw.text((PAD+28, y), moon_phase, font=fm, fill=MUTED)
+        draw.text((PAD+28, y), f"{moon_phase}{pct_str}", font=fm, fill=MUTED)
         y += ROW_MOON
 
     # Footer

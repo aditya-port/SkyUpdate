@@ -55,7 +55,7 @@ def _fmt_range(start, end) -> str:
     """Format time range — single-hour groups show 'around X' not 'X–X'."""
     if start == end:
         return f"around {_fmt(start)}"
-    return f"{_fmt_range(start, end)}"
+    return f"{_fmt(start)}–{_fmt(end)}"
 
 
 def _group(hours: list, check) -> list:

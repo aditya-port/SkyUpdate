@@ -525,39 +525,53 @@ def insight_aqi(aqi_hours: list, current: dict) -> Optional[str]:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# INSIGHT 8 — PM2.5
+# INSIGHT 8 — MASK RECOMMENDATION
+# Combines PM2.5, PM10 and dust to give a single actionable mask advice.
+# Mask types: none → surgical → N95 → N99
 # ─────────────────────────────────────────────────────────────────────────────
 
-def insight_pm25(aqi_hours: list) -> Optional[str]:
-    valid = [h for h in aqi_hours if h.get("pm2_5") is not None]
-    if not valid:
-        return None
+def insight_mask(aqi_hours: list) -> Optional[str]:
+    """
+    Recommends the right mask based on combined PM2.5, PM10 and dust levels.
+    N95 filters ≥95% of particles ≥0.3µm — recommended above PM2.5 > 55.
+    N99 for truly hazardous conditions PM2.5 > 150.
+    Surgical mask recommended for mild PM10 or dust elevation.
+    No mask needed when all values are safe.
+    """
+    pm25_vals  = [h.get("pm2_5") for h in aqi_hours if h.get("pm2_5") is not None]
+    pm10_vals  = [h.get("pm10")  for h in aqi_hours if h.get("pm10")  is not None]
+    dust_vals  = [h.get("dust")  for h in aqi_hours if h.get("dust")  is not None]
 
-    peak_row = max(valid, key=lambda h: h["pm2_5"])
-    peak_val = round(peak_row["pm2_5"], 1)
+    peak_pm25 = round(max(pm25_vals), 1) if pm25_vals else 0
+    peak_pm10 = round(max(pm10_vals), 1) if pm10_vals else 0
+    peak_dust = round(max(dust_vals), 1) if dust_vals else 0
 
-    if peak_val < 12:
-        return None  # Suppressed — clean air
+    # N99 — extremely hazardous
+    if peak_pm25 >= 150:
+        return (f"🚨 Hazardous air — N99 mask essential outdoors "
+                f"(PM2.5 {peak_pm25} µg/m³). Stay indoors if possible.")
 
-    elif peak_val < 35:
-        return None  # Acceptable — suppressed to avoid noise
+    # N95 — unhealthy for all
+    if peak_pm25 >= 55:
+        return (f"😷 N95 mask recommended outdoors "
+                f"(PM2.5 {peak_pm25} µg/m³). Filters 95% of fine particles.")
 
-    elif peak_val < 55:
-        return (f"😷 Elevated PM2.5 ({peak_val} µg/m³) around {fmt_time(peak_row['timestamp'])}. "
-                f"Sensitive groups wear a mask outdoors.")
+    # N95 for sensitive groups
+    if peak_pm25 >= 35:
+        return (f"😷 N95 mask advised for sensitive groups "
+                f"(PM2.5 {peak_pm25} µg/m³). Healthy adults can use surgical mask.")
 
-    elif peak_val < 150:
-        pm_groups = group_consecutive_hours(valid, lambda h: h.get("pm2_5", 0) >= 55)
-        if pm_groups:
-            start, end, group_rows = pm_groups[0]
-            peak_in_group = round(max(r["pm2_5"] for r in group_rows), 1)
-            return (f"⚠️ High PM2.5 ({peak_in_group} µg/m³) between {fmt_time_range(start, end)}. "
-                    f"Avoid prolonged outdoor exposure.")
-        return f"⚠️ High PM2.5 ({peak_val} µg/m³). Avoid prolonged outdoor exposure."
+    # Surgical mask for elevated PM10 or dust
+    if peak_pm10 >= 150 or peak_dust >= 100:
+        detail = f"PM10 {peak_pm10} µg/m³" if peak_pm10 >= 150 else f"dust {peak_dust} µg/m³"
+        return (f"🌫️ Surgical mask sufficient for outdoor activity "
+                f"({detail}). No N95 required.")
 
-    else:
-        return (f"🚨 Dangerous PM2.5 ({peak_val} µg/m³) between "
-                f"{fmt_time(peak_row['timestamp'])}. Stay indoors and keep windows shut.")
+    # Clean air — no mask
+    if peak_pm25 < 12 and peak_pm10 < 50 and peak_dust < 25:
+        return "🌿 Air quality is clean — no mask needed today."
+
+    return None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -595,39 +609,7 @@ def insight_ozone(aqi_hours: list) -> Optional[str]:
         return f"🚨 High ozone levels ({peak_val} µg/m³). Limit outdoor activity."
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# INSIGHT 10 — DUST
-# ─────────────────────────────────────────────────────────────────────────────
 
-def insight_dust(aqi_hours: list) -> Optional[str]:
-    valid = [h for h in aqi_hours if h.get("dust") is not None]
-    if not valid:
-        return None
-
-    peak_row = max(valid, key=lambda h: h["dust"])
-    peak_val = round(peak_row["dust"], 1)
-
-    if peak_val < 25:
-        return None  # Suppressed
-
-    elif peak_val < 50:
-        return f"🌫️ Mild dust in the air ({peak_val} µg/m³). Generally no concern."
-
-    elif peak_val < 100:
-        return (f"😷 Dusty conditions ({peak_val} µg/m³) around {fmt_time(peak_row['timestamp'])}. "
-                f"Dust-sensitive people should wear a mask outdoors.")
-
-    elif peak_val < 200:
-        dust_groups = group_consecutive_hours(valid, lambda h: h.get("dust", 0) >= 100)
-        if dust_groups:
-            start, end, _ = dust_groups[0]
-            return (f"⚠️ High dust ({peak_val} µg/m³) between {fmt_time_range(start, end)}. "
-                    f"Keep windows closed and wear a mask outside.")
-        return f"⚠️ High dust levels ({peak_val} µg/m³). Keep windows closed."
-
-    else:
-        return (f"🚨 Severe dust ({peak_val} µg/m³) between "
-                f"{fmt_time(peak_row['timestamp'])}. Avoid going outside.")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1014,6 +996,249 @@ def insight_daylight(hours: list, daily: dict) -> Optional[str]:
 # Lower number = shown first. Within the same tier, order is preserved.
 # ─────────────────────────────────────────────────────────────────────────────
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# INSIGHT NEW A — CLOTHING RECOMMENDATION
+# Combines feels-like, wind chill and rain into one "what to wear" insight.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def insight_clothing(hours: list) -> Optional[str]:
+    """
+    Recommends clothing based on the combined effect of feels-like temperature,
+    wind chill and rain probability. Only one clothing insight fires per day.
+    Priority: rain gear > cold layers > heat clothing > comfortable.
+    """
+    valid = [h for h in hours if h.get("apparent_temperature") is not None]
+    if not valid:
+        return None
+
+    peak_feels  = max(h["apparent_temperature"] for h in valid)
+    min_feels   = min(h["apparent_temperature"] for h in valid)
+    max_rain    = max((h.get("precipitation_probability", 0) for h in valid), default=0)
+    max_gusts   = max((h.get("wind_gusts_10m", 0) or 0 for h in valid), default=0)
+
+    # Rain gear takes priority
+    if max_rain >= 60:
+        if min_feels < 18:
+            return f"🧥🌧️ Wear a waterproof jacket and layer underneath — wet and cool (feels like {round(min_feels)}°C at coldest)."
+        return f"☂️ Carry an umbrella or wear a rain jacket — high chance of rain today."
+
+    # Cold conditions
+    if min_feels < 10:
+        return f"🧥 Bundle up — feels like {round(min_feels)}°C at its coldest. Heavy jacket, gloves if needed."
+    if min_feels < 18:
+        if max_gusts >= 40:
+            return f"🧥💨 Light jacket plus a windproof layer — cool and gusty (feels like {round(min_feels)}°C, gusts {round(max_gusts)} km/h)."
+        return f"🧥 A light jacket is recommended — feels like {round(min_feels)}°C at its coolest."
+
+    # Hot conditions
+    if peak_feels >= 42:
+        return f"👕 Wear light, loose, light-coloured clothing — dangerous heat (feels like {round(peak_feels)}°C peak). Cover skin from direct sun."
+    if peak_feels >= 35:
+        return f"👕 Light breathable clothing recommended — warm day peaking at {round(peak_feels)}°C feels-like."
+
+    # Comfortable range — light rain possible
+    if max_rain >= 30:
+        return f"👔 Comfortable day ({round(min_feels)}–{round(peak_feels)}°C feels-like) but keep a light rain jacket handy."
+
+    return f"👕 Comfortable clothing day — feels like {round(min_feels)}–{round(peak_feels)}°C. No special gear needed."
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# INSIGHT NEW B — COMMUTE WINDOW ALERT
+# Flags if worst weather falls during typical commute hours 8–9 AM or 6–7 PM.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def insight_commute(hours: list, aqi_hours: list) -> Optional[str]:
+    """
+    Checks if heavy rain, dangerous heat, poor AQI or severe wind falls
+    during commute windows: morning (7–9 AM) or evening (5–7 PM).
+    Returns a specific warning with timing so user can plan accordingly.
+    """
+    def _commute_hour(ts) -> bool:
+        if ts is None: return False
+        h = ts.hour if hasattr(ts, "hour") else int(str(ts)[11:13])
+        return (7 <= h < 9) or (17 <= h < 19)
+
+    commute_h = [h for h in hours if _commute_hour(h.get("timestamp"))]
+    if not commute_h:
+        return None
+
+    issues = []
+
+    # Heavy rain during commute
+    max_rain = max((h.get("precipitation_probability", 0) for h in commute_h), default=0)
+    if max_rain >= 70:
+        peak = max(commute_h, key=lambda h: h.get("precipitation_probability", 0))
+        slot = "morning commute" if peak["timestamp"].hour < 12 else "evening commute"
+        issues.append(f"heavy rain during {slot} ({round(max_rain)}%)")
+
+    # Dangerous heat during commute
+    max_feels = max((h.get("apparent_temperature", 0) or 0 for h in commute_h), default=0)
+    if max_feels >= 40:
+        issues.append(f"dangerous heat during commute (feels like {round(max_feels)}°C)")
+
+    # Poor AQI during commute
+    aqi_by_hour = {}
+    for row in aqi_hours:
+        ts = row.get("timestamp")
+        if ts: aqi_by_hour[(ts.date(), ts.hour)] = row
+    commute_aqi = [aqi_by_hour.get((h["timestamp"].date(), h["timestamp"].hour), {})
+                   for h in commute_h]
+    max_aqi = max((r.get("us_aqi", 0) or 0 for r in commute_aqi), default=0)
+    if max_aqi >= 150:
+        issues.append(f"unhealthy air during commute (AQI {round(max_aqi)})")
+
+    # Strong gusts during commute
+    max_gusts = max((h.get("wind_gusts_10m", 0) or 0 for h in commute_h), default=0)
+    if max_gusts >= 55:
+        issues.append(f"strong wind gusts during commute ({round(max_gusts)} km/h)")
+
+    if not issues:
+        return None
+
+    if len(issues) == 1:
+        return f"🚗 Commute alert — {issues[0].capitalize()}. Plan accordingly."
+    return f"🚗 Commute alert — {' and '.join(issues).capitalize()}. Consider adjusting travel time."
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# INSIGHT NEW C — SLEEP QUALITY FORECAST
+# Night-time temperature, humidity and AQI combined into overnight comfort score.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def insight_sleep(hours: list, aqi_hours: list) -> Optional[str]:
+    """
+    Evaluates overnight comfort for sleep based on temperature (18–22°C ideal),
+    humidity (<60% ideal) and AQI (<100 ideal).
+    Only looks at hours between 10 PM and 6 AM.
+    """
+    night_h = [h for h in hours
+               if h.get("timestamp") and
+               (h["timestamp"].hour >= 22 or h["timestamp"].hour < 6)]
+    if not night_h:
+        return None
+
+    temps    = [h.get("apparent_temperature") for h in night_h if h.get("apparent_temperature") is not None]
+    humidity = [h.get("relative_humidity_2m") for h in night_h if h.get("relative_humidity_2m") is not None]
+
+    if not temps:
+        return None
+
+    avg_temp = sum(temps) / len(temps)
+    avg_hum  = sum(humidity) / len(humidity) if humidity else None
+
+    aqi_by_hour = {}
+    for row in aqi_hours:
+        ts = row.get("timestamp")
+        if ts: aqi_by_hour[(ts.date(), ts.hour)] = row
+    night_aqi = [aqi_by_hour.get((h["timestamp"].date(), h["timestamp"].hour), {})
+                 for h in night_h]
+    avg_aqi = sum(r.get("us_aqi", 0) or 0 for r in night_aqi) / len(night_aqi) if night_aqi else 0
+
+    issues = []
+    if avg_temp > 28:
+        issues.append(f"hot ({round(avg_temp)}°C overnight — fan or AC recommended)")
+    elif avg_temp > 24:
+        issues.append(f"warm overnight ({round(avg_temp)}°C — keep windows open if possible)")
+    elif avg_temp < 14:
+        issues.append(f"cold overnight ({round(avg_temp)}°C — extra blanket recommended)")
+
+    if avg_hum and avg_hum > 80:
+        issues.append(f"high humidity ({round(avg_hum)}% — may feel sticky and uncomfortable)")
+
+    if avg_aqi > 150:
+        issues.append("poor overnight air quality — keep windows closed")
+
+    if not issues:
+        if 18 <= avg_temp <= 22:
+            return f"😴 Great night for sleep — comfortable {round(avg_temp)}°C overnight with good air quality."
+        return None
+
+    return f"😴 Sleep forecast — {', '.join(issues).capitalize()}."
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# INSIGHT NEW D — COMBINED POLLEN LOAD
+# Merges grass/alder/birch pollen into one score instead of three bullets.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def insight_pollen_combined(aqi_hours: list) -> Optional[str]:
+    """
+    Combines grass, alder and birch pollen into a single overall pollen load
+    insight. Reports which type is dominant and overall severity.
+    Replaces three separate pollen insights with one actionable summary.
+    """
+    keys = [("grass_pollen", "Grass"), ("alder_pollen", "Alder"), ("birch_pollen", "Birch")]
+    peaks = {}
+    for key, name in keys:
+        vals = [h.get(key) for h in aqi_hours if h.get(key) is not None]
+        if vals:
+            peaks[name] = round(max(vals), 1)
+
+    if not peaks:
+        return None
+
+    total = sum(peaks.values())
+    dominant = max(peaks, key=peaks.get)
+    dominant_val = peaks[dominant]
+
+    if dominant_val < 10:
+        return None  # All low — suppressed
+
+    active = [f"{n} ({v})" for n, v in peaks.items() if v >= 10]
+    active_str = ", ".join(active)
+
+    if dominant_val >= 120:
+        return (f"🤧 Very high pollen load today — {active_str}. "
+                f"Allergy sufferers stay indoors and take antihistamines before going out.")
+    if dominant_val >= 60:
+        return (f"🌸 High pollen today — {active_str}. "
+                f"Take antihistamines before going outside. Sunglasses help with eye irritation.")
+    if dominant_val >= 30:
+        return (f"🌸 Moderate pollen — {active_str}. "
+                f"Allergy sufferers may want to take antihistamines.")
+    return (f"🌿 Low pollen levels — {active_str}. Generally not a concern for most people.")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# INSIGHT NEW E — HYDRATION REMINDER
+# Fires when heat index > 35°C or humidity > 80% to remind users to drink water.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def insight_hydration(hours: list) -> Optional[str]:
+    """
+    Calculates estimated extra water intake needed based on heat index and humidity.
+    WHO recommends 2L/day baseline — adds 500ml per heat tier above comfort zone.
+    Only fires when conditions meaningfully increase dehydration risk.
+    """
+    valid = [h for h in hours
+             if h.get("temperature_2m") is not None and h.get("relative_humidity_2m") is not None]
+    if not valid:
+        return None
+
+    hi_rows = [(h, heat_index(h["temperature_2m"], h["relative_humidity_2m"])) for h in valid]
+    peak_row, peak_hi = max(hi_rows, key=lambda x: x[1])
+    avg_hum = sum(h.get("relative_humidity_2m", 0) for h in valid) / len(valid)
+
+    if peak_hi < 32 and avg_hum < 75:
+        return None  # Normal conditions — no extra hydration needed
+
+    if peak_hi >= 45:
+        return (f"💧 Drink at least 3.5L of water today — dangerous heat stress "
+                f"(heat index {peak_hi}°C). Sip water every 15–20 minutes when outside.")
+    if peak_hi >= 38:
+        return (f"💧 Drink at least 3L of water today — high heat stress "
+                f"(heat index {peak_hi}°C). Avoid caffeine and alcohol which increase dehydration.")
+    if peak_hi >= 32:
+        return (f"💧 Stay well hydrated — heat index reaching {peak_hi}°C. "
+                f"Aim for 2.5L+ of water and avoid prolonged sun exposure.")
+    if avg_hum >= 80:
+        return (f"💧 High humidity ({round(avg_hum)}%) increases sweat loss even in shade. "
+                f"Drink water regularly throughout the day.")
+    return None
+
+
 def generate_insights_split(hours: list, aqi_hours: list, daily: dict, current: dict) -> tuple[str, str]:
     """
     Same as generate_insights_from_data but returns (visible_text, hidden_text).
@@ -1028,16 +1253,17 @@ def generate_insights_split(hours: list, aqi_hours: list, daily: dict, current: 
         (1, insight_temperature(hours)),
         (2, insight_rain(hours)),
         (3, insight_aqi(aqi_hours, current)),
-        (3, insight_pm25(aqi_hours)),
+        (3, insight_mask(aqi_hours)),
         (3, insight_ozone(aqi_hours)),
-        (3, insight_dust(aqi_hours)),
-        (3, insight_pollen(aqi_hours, "grass_pollen", "Grass", "🌿")),
-        (3, insight_pollen(aqi_hours, "alder_pollen", "Alder", "🌳")),
-        (3, insight_pollen(aqi_hours, "birch_pollen", "Birch", "🌲")),
+        (3, insight_pollen_combined(aqi_hours)),
         (3, insight_aqi_trend(aqi_hours)),
         (4, insight_uv(hours)),
+        (4, insight_clothing(hours)),
+        (4, insight_commute(hours, aqi_hours)),
         (5, insight_wind(hours)),
         (5, insight_wind_chill(hours)),
+        (5, insight_hydration(hours)),
+        (6, insight_sleep(hours, aqi_hours)),
         (6, insight_sunshine(hours)),
         (6, insight_visibility(hours)),
         (6, insight_pressure(hours)),
@@ -1058,7 +1284,8 @@ def generate_insights_split(hours: list, aqi_hours: list, daily: dict, current: 
     has_tier1 = any(tier == 1 for tier, _ in triggered)
     _positive_keywords = ("best time to", "best outdoor", "great day to dry",
                           "clear skies expected at sunset", "air quality is suitable",
-                          "great conditions for")
+                          "great conditions for", "comfortable clothing day",
+                          "great night for sleep", "no mask needed")
     if has_tier1:
         triggered = [
             (tier, text) for tier, text in triggered

@@ -14,6 +14,7 @@ All functions return fully formatted strings ready to send to Telegram.
 No formatting logic lives here — that lives in the engine files.
 """
 
+import asyncio
 import asyncpg
 import os
 from datetime import datetime, date, timedelta
@@ -104,7 +105,6 @@ async def generate_insights(user_id: int, area: str) -> str:
         now   = datetime.now()
         today = date.today()
 
-        # Remaining hourly weather rows for today (from now to midnight)
         hourly_rows = await conn.fetch(
             """
             SELECT timestamp, temperature_2m, relative_humidity_2m,
@@ -115,15 +115,11 @@ async def generate_insights(user_id: int, area: str) -> str:
                    uv_index, weather_code, sunshine_duration,
                    is_day, freezing_level_height
             FROM hourly_weather
-            WHERE run_id = $1
-              AND timestamp >= $2
-              AND DATE(timestamp) = $3
+            WHERE run_id = $1 AND timestamp >= $2 AND DATE(timestamp) = $3
             ORDER BY timestamp ASC
             """,
             run_id, now, today
         )
-
-        # Remaining hourly AQI rows for today
         aqi_rows = await conn.fetch(
             """
             SELECT timestamp, pm10, pm2_5, carbon_monoxide,
@@ -131,15 +127,11 @@ async def generate_insights(user_id: int, area: str) -> str:
                    us_aqi, aqi_category, dust, uv_index,
                    uv_index_clear_sky, alder_pollen, birch_pollen, grass_pollen
             FROM hourly_aqi
-            WHERE run_id = $1
-              AND timestamp >= $2
-              AND DATE(timestamp) = $3
+            WHERE run_id = $1 AND timestamp >= $2 AND DATE(timestamp) = $3
             ORDER BY timestamp ASC
             """,
             run_id, now, today
         )
-
-        # Today's daily summary row (for sunset, UV max, etc.)
         daily_row = await conn.fetchrow(
             """
             SELECT date, temperature_2m_max, temperature_2m_min,
@@ -150,18 +142,10 @@ async def generate_insights(user_id: int, area: str) -> str:
                    wind_direction_10m_dominant, uv_index_max,
                    shortwave_radiation_sum, et0_fao_evapotranspiration,
                    weather_code_max
-            FROM daily_weather
-            WHERE run_id = $1
-              AND date = $2
-            LIMIT 1
+            FROM daily_weather WHERE run_id = $1 AND date = $2 LIMIT 1
             """,
             run_id, today
         )
-
-        # Current conditions snapshot — also pulls scraped_aqi_value and
-        # scraped_aqi_category which are the weather.com AQI values stored
-        # by the scraper. These are used by insight_aqi() as the primary
-        # display value — us_aqi is stored here too but only for internal scoring.
         current_row = await conn.fetchrow(
             """
             SELECT timestamp, temperature_2m, relative_humidity_2m,
@@ -170,9 +154,7 @@ async def generate_insights(user_id: int, area: str) -> str:
                    wind_direction_10m, wind_gusts_10m, visibility,
                    uv_index, is_day, weather_code, us_aqi,
                    scraped_aqi_value, scraped_aqi_category
-            FROM current_weather
-            WHERE run_id = $1
-            LIMIT 1
+            FROM current_weather WHERE run_id = $1 LIMIT 1
             """,
             run_id
         )
@@ -626,7 +608,6 @@ async def generate_bonus_insights(user_id: int, area: str) -> str:
             """,
             run_id, now, today
         )
-
         aqi_rows = await conn.fetch(
             """
             SELECT timestamp, us_aqi, pm2_5, ozone
@@ -638,7 +619,6 @@ async def generate_bonus_insights(user_id: int, area: str) -> str:
             """,
             run_id, now, today
         )
-
         daily_row = await conn.fetchrow(
             """
             SELECT sunset, weather_code_max
