@@ -236,48 +236,54 @@ def insight_rain(hours: list) -> Optional[str]:
             return (f"🌧️ Rain likely around {fmt_time(peak_row['timestamp'])} "
                     f"({round(peak_row['precipitation_probability'])}%). Carry an umbrella.")
 
-        # Pick the most significant window (highest total mm, or highest prob if mm=0)
-        biggest = max(
-            rain_groups,
-            key=lambda g: (
-                sum(r.get("rain", 0) for r in g[2]),
-                max(r.get("precipitation_probability", 0) for r in g[2])
-            )
-        )
-        start, end, group_rows = biggest
-        total_mm        = round(sum(r.get("rain", 0) for r in group_rows), 1)
-        max_prob_window = round(max(r.get("precipitation_probability", 0) for r in group_rows))
-        duration_hrs    = len(group_rows)  # each row = 1 hour
+        # Sort all windows by start time for chronological display
+        rain_groups.sort(key=lambda g: g[0])
 
-        # Intensity based on mm/hr rate
-        mm_per_hr = total_mm / duration_hrs if duration_hrs > 0 else 0
-        if mm_per_hr >= 7.5 or max_prob_window >= 85:
-            intensity = "heavy"
-            emoji = "⛈️"
-        elif mm_per_hr >= 2.5:
-            intensity = "moderate"
-            emoji = "🌧️"
-        else:
-            intensity = "light"
-            emoji = "🌦️"
-
-        mm_str = f" (~{total_mm}mm total)" if total_mm >= 0.5 else ""
-
-        # "Leave before" framing — compare rain start to now
+        # "Leave before" framing based on the FIRST upcoming window
         now = __import__("datetime").datetime.now()
-        mins_until = int((start - now).total_seconds() / 60) if start > now else 0
+        first_start = rain_groups[0][0]
+        mins_until = int((first_start - now).total_seconds() / 60) if first_start > now else 0
 
         if mins_until > 90:
-            timing = f"Rain starts around {fmt_time(start)} — you have time to leave before it hits."
+            timing_prefix = f"Rain starts around {fmt_time(first_start)} — you have time to leave before it hits."
         elif mins_until > 30:
-            timing = f"Rain starts around {fmt_time(start)} — leave soon if you need to go out."
+            timing_prefix = f"Rain starts around {fmt_time(first_start)} — leave soon if you need to go out."
         elif mins_until > 0:
-            timing = f"Rain starting very soon ({mins_until} min) — take an umbrella now."
+            timing_prefix = f"Rain starting very soon ({mins_until} min) — take an umbrella now."
         else:
-            timing = f"Rain ongoing until around {fmt_time(end)}."
+            timing_prefix = ""
 
-        return (f"{emoji} {intensity.capitalize()} rain {fmt_time_range(start, end)}{mm_str} "
-                f"({max_prob_window}% chance). {timing}")
+        if len(rain_groups) == 1:
+            start, end, group_rows = rain_groups[0]
+            total_mm        = round(sum(r.get("rain", 0) for r in group_rows), 1)
+            max_prob_window = round(max(r.get("precipitation_probability", 0) for r in group_rows))
+            duration_hrs    = len(group_rows)
+            mm_per_hr = total_mm / duration_hrs if duration_hrs > 0 else 0
+            if mm_per_hr >= 7.5 or max_prob_window >= 85:
+                intensity, emoji = "heavy", "⛈️"
+            elif mm_per_hr >= 2.5:
+                intensity, emoji = "moderate", "🌧️"
+            else:
+                intensity, emoji = "light", "🌦️"
+            mm_str = f" (~{total_mm}mm)" if total_mm >= 0.5 else ""
+            timing = f" {timing_prefix}" if timing_prefix else ""
+            return (f"{emoji} {intensity.capitalize()} rain {fmt_time_range(start, end)}{mm_str} "
+                    f"({max_prob_window}% chance).{timing}")
+        else:
+            # Multiple windows — list all of them clearly
+            window_parts = []
+            total_mm_all = 0
+            for g_start, g_end, g_rows in rain_groups:
+                g_mm = round(sum(r.get("rain", 0) for r in g_rows), 1)
+                g_prob = round(max(r.get("precipitation_probability", 0) for r in g_rows))
+                total_mm_all += g_mm
+                mm_part = f" ~{g_mm}mm" if g_mm >= 0.5 else ""
+                window_parts.append(f"{fmt_time_range(g_start, g_end)} ({g_prob}%{mm_part})")
+            windows_str = " and ".join(window_parts) if len(window_parts) == 2 else ", ".join(window_parts[:-1]) + f" and {window_parts[-1]}"
+            total_str = f" (~{round(total_mm_all, 1)}mm total)" if total_mm_all >= 0.5 else ""
+            timing = f" {timing_prefix}" if timing_prefix else ""
+            return (f"🌧️ Rain expected in {len(rain_groups)} windows today: {windows_str}{total_str}. "
+                    f"Carry an umbrella all day.{timing}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -330,7 +336,14 @@ def insight_uv(hours: list) -> Optional[str]:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def insight_wind(hours: list) -> Optional[str]:
-    valid = [h for h in hours if h.get("wind_gusts_10m") is not None]
+    # Only consider remaining daytime hours — a 2 AM gust is irrelevant to the user
+    valid = [
+        h for h in hours
+        if h.get("wind_gusts_10m") is not None and h.get("is_day", 0) == 1
+    ]
+    # If no daytime hours left, fall back to all remaining hours
+    if not valid:
+        valid = [h for h in hours if h.get("wind_gusts_10m") is not None]
     if not valid:
         return None
 
@@ -453,6 +466,72 @@ def insight_sunshine(hours: list) -> Optional[str]:
 # us_aqi from hourly_aqi is stored in DB and used for internal scoring only —
 # it is never shown raw to the user as the headline AQI number.
 # ─────────────────────────────────────────────────────────────────────────────
+
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# INSIGHT NEW — CLOUD COVER TREND
+# Detects if skies are clearing or worsening, not just the average.
+# Only fires when there is a meaningful directional change (≥30% shift).
+# ─────────────────────────────────────────────────────────────────────────────
+
+def insight_cloud_trend(hours: list) -> Optional[str]:
+    """
+    Detects direction of cloud cover change across the remaining day.
+    Splits daytime into first half and second half and compares averages.
+    Only fires when there is a meaningful shift — not for consistently cloudy
+    or consistently clear days (insight_sunshine handles those).
+    """
+    daytime = [h for h in hours if h.get("is_day", 0) == 1 and h.get("cloud_cover") is not None]
+    if len(daytime) < 4:
+        return None
+
+    mid = len(daytime) // 2
+    first_half  = daytime[:mid]
+    second_half = daytime[mid:]
+
+    avg_first  = sum(h["cloud_cover"] for h in first_half)  / len(first_half)
+    avg_second = sum(h["cloud_cover"] for h in second_half) / len(second_half)
+    change = avg_second - avg_first  # positive = more cloud later
+
+    if abs(change) < 30:
+        return None  # Not enough directional shift to be worth mentioning
+
+    # Find the transition point (hour where cloud cover crosses midpoint)
+    threshold = (avg_first + avg_second) / 2
+    turning_point = None
+    if change < 0:  # clearing — find first hour where cloud drops below threshold
+        for h in daytime:
+            if h["cloud_cover"] <= threshold:
+                turning_point = h["timestamp"]
+                break
+    else:  # worsening — find first hour where cloud exceeds threshold
+        for h in daytime:
+            if h["cloud_cover"] >= threshold:
+                turning_point = h["timestamp"]
+                break
+
+    if change <= -40:
+        tp_str = f" from around {fmt_time(turning_point)}" if turning_point else ""
+        return (f"🌤️ Skies clearing{tp_str} — cloud cover drops from {round(avg_first)}% to "
+                f"{round(avg_second)}% by afternoon. Plan outdoor activity for later.")
+
+    if change <= -30:
+        tp_str = f" after {fmt_time(turning_point)}" if turning_point else ""
+        return (f"⛅ Gradual clearing expected{tp_str}. Morning is cloudier "
+                f"({round(avg_first)}%) but afternoon opens up ({round(avg_second)}%).")
+
+    if change >= 40:
+        tp_str = f" from around {fmt_time(turning_point)}" if turning_point else ""
+        return (f"🌥️ Skies closing in{tp_str} — cloud cover rises from {round(avg_first)}% to "
+                f"{round(avg_second)}% through the day. Get outdoor plans done earlier.")
+
+    if change >= 30:
+        tp_str = f" after {fmt_time(turning_point)}" if turning_point else ""
+        return (f"⛅ Increasing cloud cover expected{tp_str} — morning is clearer "
+                f"({round(avg_first)}%) than the afternoon ({round(avg_second)}%).")
+
+    return None
 
 def insight_aqi(aqi_hours: list, current: dict) -> Optional[str]:
     """
@@ -616,6 +695,78 @@ def insight_ozone(aqi_hours: list) -> Optional[str]:
 # INSIGHT 11/12/13 — POLLEN (Grass, Alder, Birch)
 # ─────────────────────────────────────────────────────────────────────────────
 
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# INSIGHT NEW — RESPIRATORY ADVISORY
+# Combines ozone + PM2.5 + pollen into one respiratory health score.
+# Replaces insight_ozone as the single respiratory risk signal.
+# Specifically useful for asthma, COPD, allergy sufferers.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def insight_respiratory(aqi_hours: list) -> Optional[str]:
+    """
+    Calculates a combined respiratory stress score from:
+    - Ozone (µg/m³): above 140 = moderate stress, above 180 = high
+    - PM2.5 (µg/m³): above 35 = moderate, above 55 = high
+    - Pollen (grass + alder + birch, grains/m³): above 30 any = moderate, above 60 = high
+
+    Fires only when at least 2 of the 3 factors are elevated, or 1 is severely elevated.
+    Gives one unified message covering all active respiratory risks.
+    """
+    pm25_vals  = [h.get("pm2_5")  for h in aqi_hours if h.get("pm2_5")  is not None]
+    ozone_vals = [h.get("ozone")  for h in aqi_hours if h.get("ozone")  is not None]
+
+    # Pollen — take the highest of all three types
+    pollen_peaks = []
+    for key in ("grass_pollen", "alder_pollen", "birch_pollen"):
+        vals = [h.get(key) for h in aqi_hours if h.get(key) is not None]
+        if vals:
+            pollen_peaks.append(max(vals))
+    peak_pollen = max(pollen_peaks) if pollen_peaks else 0
+
+    peak_pm25  = max(pm25_vals)  if pm25_vals  else 0
+    peak_ozone = max(ozone_vals) if ozone_vals else 0
+
+    # Score each factor: 0 = fine, 1 = moderate, 2 = high
+    pm25_score  = 2 if peak_pm25 >= 55  else (1 if peak_pm25 >= 35  else 0)
+    ozone_score = 2 if peak_ozone >= 180 else (1 if peak_ozone >= 140 else 0)
+    pollen_score= 2 if peak_pollen >= 60 else (1 if peak_pollen >= 30 else 0)
+
+    total_score = pm25_score + ozone_score + pollen_score
+
+    if total_score == 0:
+        return None  # All fine — no respiratory advisory needed
+
+    # Build active factor list for message
+    factors = []
+    if pm25_score >= 1:
+        factors.append(f"PM2.5 {round(peak_pm25, 1)} µg/m³")
+    if ozone_score >= 1:
+        factors.append(f"ozone {round(peak_ozone)} µg/m³")
+    if pollen_score >= 1:
+        pollen_name = "grass" if peak_pollen == max(pollen_peaks) and pollen_peaks else "pollen"
+        factors.append(f"{pollen_name} pollen active")
+
+    factor_str = " + ".join(factors)
+
+    if total_score >= 4:
+        return (f"😮‍💨 High respiratory stress today — {factor_str}. "
+                f"People with asthma or COPD should stay indoors and carry inhalers. "
+                f"N95 mask essential if going outside.")
+
+    if total_score >= 2:
+        action = "carry inhalers if you have respiratory conditions" if pm25_score + ozone_score >= 2 else "take antihistamines before going out"
+        return (f"😮‍💨 Moderate respiratory stress — {factor_str}. "
+                f"Sensitive individuals should {action}.")
+
+    # Score of 1 — only one factor mildly elevated
+    if pm25_score == 1 or ozone_score == 1:
+        return (f"😮‍💨 Mild respiratory irritants today — {factor_str}. "
+                f"Generally fine for healthy adults, but those with respiratory conditions should take precautions.")
+
+    return None
+
 def insight_pollen(aqi_hours: list, pollen_key: str, name: str, emoji: str) -> Optional[str]:
     valid = [h for h in aqi_hours if h.get(pollen_key) is not None]
     if not valid:
@@ -650,6 +801,61 @@ def insight_pollen(aqi_hours: list, pollen_key: str, name: str, emoji: str) -> O
 # ─────────────────────────────────────────────────────────────────────────────
 # INSIGHT 14 — HEAT STRESS (Heat Index formula — NWS)
 # ─────────────────────────────────────────────────────────────────────────────
+
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# INSIGHT NEW — HEAT STROKE RISK WINDOW
+# Fires only when temp + humidity + UV all align simultaneously in daytime.
+# More specific than heat_stress — that fires on heat index alone.
+# This fires when all three risk factors peak together.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def insight_heat_stroke(hours: list) -> Optional[str]:
+    """
+    Heat stroke risk requires all three conditions simultaneously:
+    - Heat index ≥ 41°C (danger zone)
+    - UV index ≥ 8 (very high — direct sun amplifies heat stroke risk)
+    - Daytime only (is_day == 1)
+    Separate from heat_stress which fires on heat index alone.
+    Returns a specific time window when risk is highest.
+    """
+    valid = [
+        h for h in hours
+        if h.get("temperature_2m") is not None
+        and h.get("relative_humidity_2m") is not None
+        and h.get("uv_index") is not None
+        and h.get("is_day", 0) == 1
+    ]
+    if not valid:
+        return None
+
+    risk_hours = []
+    for h in valid:
+        hi = heat_index(h["temperature_2m"], h["relative_humidity_2m"])
+        uv = h.get("uv_index", 0)
+        if hi >= 41 and uv >= 8:
+            risk_hours.append((h, hi, uv))
+
+    if not risk_hours:
+        return None
+
+    # Find peak risk hour
+    peak = max(risk_hours, key=lambda x: x[1] + x[2])
+    peak_h, peak_hi, peak_uv = peak
+
+    # Group consecutive risk hours for time window
+    risk_only = [x[0] for x in risk_hours]
+    groups = group_consecutive_hours(risk_only, lambda h: True)
+
+    if groups:
+        start, end, _ = groups[0]
+        window_str = fmt_time_range(start, end)
+        return (f"🚨 Heat stroke risk window {window_str} — heat index {peak_hi}°C with UV {round(peak_uv)}. "
+                f"Do not exercise outdoors. Stay in shade or indoors and drink water every 15 minutes.")
+
+    return (f"🚨 Heat stroke risk around {fmt_time(peak_h['timestamp'])} — "
+            f"heat index {peak_hi}°C with UV {round(peak_uv)}. Stay indoors during this window.")
 
 def insight_heat_stress(hours: list) -> Optional[str]:
     valid = [h for h in hours
@@ -1221,6 +1427,11 @@ def insight_hydration(hours: list) -> Optional[str]:
     peak_row, peak_hi = max(hi_rows, key=lambda x: x[1])
     avg_hum = sum(h.get("relative_humidity_2m", 0) for h in valid) / len(valid)
 
+    # Temperature floor — hydration only meaningful when warm enough to sweat
+    max_temp = max(h.get("temperature_2m", 0) for h in valid)
+    if max_temp < 25 and peak_hi < 32:
+        return None  # Too cool for meaningful dehydration risk
+
     if peak_hi < 32 and avg_hum < 75:
         return None  # Normal conditions — no extra hydration needed
 
@@ -1252,9 +1463,10 @@ def generate_insights_split(hours: list, aqi_hours: list, daily: dict, current: 
         (1, insight_snow(hours)),
         (1, insight_temperature(hours)),
         (2, insight_rain(hours)),
+        (1, insight_heat_stroke(hours)),
         (3, insight_aqi(aqi_hours, current)),
         (3, insight_mask(aqi_hours)),
-        (3, insight_ozone(aqi_hours)),
+        (3, insight_respiratory(aqi_hours)),
         (3, insight_pollen_combined(aqi_hours)),
         (3, insight_aqi_trend(aqi_hours)),
         (4, insight_uv(hours)),
@@ -1265,8 +1477,8 @@ def generate_insights_split(hours: list, aqi_hours: list, daily: dict, current: 
         (5, insight_hydration(hours)),
         (6, insight_sleep(hours, aqi_hours)),
         (6, insight_sunshine(hours)),
+        (6, insight_cloud_trend(hours)),
         (6, insight_visibility(hours)),
-        (6, insight_pressure(hours)),
         (6, insight_best_outdoor_window(hours, aqi_hours)),
         (6, insight_daylight(hours, daily)),
     ]
@@ -1285,7 +1497,9 @@ def generate_insights_split(hours: list, aqi_hours: list, daily: dict, current: 
     _positive_keywords = ("best time to", "best outdoor", "great day to dry",
                           "clear skies expected at sunset", "air quality is suitable",
                           "great conditions for", "comfortable clothing day",
-                          "great night for sleep", "no mask needed")
+                          "great night for sleep", "no mask needed",
+                          "photography windows", "golden hour", "skies clearing",
+                          "gradual clearing")
     if has_tier1:
         triggered = [
             (tier, text) for tier, text in triggered
@@ -1301,11 +1515,44 @@ def generate_insights_split(hours: list, aqi_hours: list, daily: dict, current: 
         triggered = [(tier, text) for tier, text in triggered
                      if "dangerous heat" not in text.lower() or "heat stress" not in text.lower()]
 
+    # ── Clothing + temperature deduplication ──────────────────────────────────
+    # insight_clothing is more specific and actionable — if it fires, suppress
+    # insight_temperature which says the same thing at a higher level.
+    has_clothing    = any(tier == 4 and ("jacket" in t.lower() or "wear" in t.lower() or "clothing" in t.lower()) for tier, t in triggered)
+    has_temperature = any(tier == 1 and ("jacket" in t.lower() or "cool day" in t.lower() or "warm day" in t.lower() or "cold day" in t.lower()) for tier, t in triggered)
+    if has_clothing and has_temperature:
+        triggered = [(tier, text) for tier, text in triggered
+                     if not (tier == 1 and ("jacket" in text.lower() or "cool day" in text.lower() or "warm day" in text.lower() or "cold day" in text.lower()))]
+
+    # ── AQI + mask deduplication ───────────────────────────────────────────────
+    # If both AQI insight and mask insight fire and both indicate bad air,
+    # merge them into one combined bullet. AQI insight wins — mask detail appended.
+    aqi_items  = [(tier, text) for tier, text in triggered if tier == 3 and ("air quality" in text.lower() or "aqi" in text.lower()) and "mask" not in text.lower()]
+    mask_items = [(tier, text) for tier, text in triggered if "n95" in text.lower() or "n99" in text.lower() or "surgical mask" in text.lower()]
+    if aqi_items and mask_items:
+        # Remove both from triggered, add merged version
+        aqi_tier, aqi_text  = aqi_items[0]
+        _,         mask_text = mask_items[0]
+        # Extract mask recommendation (everything after the dash)
+        mask_action = mask_text.split("—")[1].strip() if "—" in mask_text else mask_text
+        merged = f"{aqi_text.rstrip('.')} — {mask_action}"
+        triggered = [(tier, text) for tier, text in triggered
+                     if text not in (aqi_text, mask_items[0][1])]
+        triggered.append((aqi_tier, merged))
+        triggered.sort(key=lambda x: x[0])
+
     visible_items = [text for tier, text in triggered if tier <= 2]
     hidden_items  = [text for tier, text in triggered if tier > 2]
 
-    total = len(triggered)
-    header = f"💡 Insights ({total} active)\n\n"
+    # Severity-weighted header — shows alerts separately from tips
+    alert_count = sum(1 for tier, _ in triggered if tier <= 2)
+    tip_count   = sum(1 for tier, _ in triggered if tier > 2)
+    if alert_count > 0 and tip_count > 0:
+        header = f"💡 {alert_count} alert{'s' if alert_count > 1 else ''} · {tip_count} tip{'s' if tip_count > 1 else ''}\n\n"
+    elif alert_count > 0:
+        header = f"⚠️ {alert_count} alert{'s' if alert_count > 1 else ''} today\n\n"
+    else:
+        header = f"💡 {tip_count} tip{'s' if tip_count > 1 else ''} for today\n\n"
 
     if not visible_items:
         visible_items = [text for _, text in triggered[:2]]
@@ -1385,10 +1632,23 @@ def get_best_run_time(hours: list, aqi_hours: list) -> Optional[str]:
     if best_row is None or best_score < 5:
         return None
 
+    # Rain mutual exclusion — check if rain is likely within 2 hours of best window
+    best_ts = best_row["timestamp"]
+    nearby_rain = any(
+        h.get("precipitation_probability", 0) >= 50
+        for h in hours
+        if h.get("timestamp") and abs((h["timestamp"] - best_ts).total_seconds()) <= 7200
+    )
+
     temp_str = f"{round(best_row.get('apparent_temperature', 0))}°C"
     aqi_note = " with clean air" if best_aqi < 100 else ""
+    if nearby_rain:
+        return (
+            f"🏃 Best time to exercise outside: {fmt_time(best_ts)} — "
+            f"comfortable at {temp_str}{aqi_note}, though rain is possible nearby. Check conditions first."
+        )
     return (
-        f"🏃 Best time to exercise outside today: {fmt_time(best_row['timestamp'])}. "
+        f"🏃 Best time to exercise outside today: {fmt_time(best_ts)}. "
         f"Comfortable at {temp_str}{aqi_note} and low UV."
     )
 
@@ -1488,9 +1748,17 @@ def get_laundry_score(hours: list) -> Optional[str]:
 
 def get_golden_hour(daily: dict) -> Optional[str]:
     """
-    Returns a golden-hour notification string if sunset looks clear today.
-    Uses weather_code_max from the daily row as a proxy for sky clarity.
-    Returns None if sunset has already passed or conditions are poor.
+    Returns a golden hour + blue hour alert when conditions are suitable for photography.
+    Golden hour: ~30 minutes before sunset (warm directional light).
+    Blue hour:   ~20–40 minutes after sunset (cool twilight, even illumination).
+
+    Clear sky WMO codes: 0 = clear sky, 1 = mainly clear, 2 = partly cloudy.
+    Partly cloudy (2) is actually ideal for golden hour — some cloud diffuses light.
+    WMO codes 3+ (overcast, rain, fog) suppress the alert.
+
+    Only fires if:
+    - Sunset hasn't passed yet
+    - WMO code indicates clear/partly cloudy conditions
     """
     sunset = daily.get("sunset")
     if not sunset:
@@ -1505,14 +1773,29 @@ def get_golden_hour(daily: dict) -> Optional[str]:
     if sunset <= now:
         return None  # Sun already set
 
-    # WMO codes 0, 1, 2 = clear / mainly clear / partly cloudy — good for sunset
+    # WMO codes 0, 1, 2 = clear / mainly clear / partly cloudy — suitable for golden hour
     wmo = daily.get("weather_code_max", 99)
-    if wmo in (0, 1, 2):
-        return (
-            f"🌅 Clear skies expected at sunset ({fmt_time(sunset)}). "
-            f"Great time for photography or an evening walk."
-        )
-    return None
+    if wmo not in (0, 1, 2):
+        return None  # Overcast, rain or fog — no worthwhile golden hour
+
+    # Calculate golden hour start (~30 min before sunset) and blue hour (~25 min after)
+    golden_start = sunset - timedelta(minutes=30)
+    blue_start   = sunset + timedelta(minutes=5)
+    blue_end     = sunset + timedelta(minutes=35)
+
+    golden_str = fmt_time(golden_start)
+    sunset_str = fmt_time(sunset)
+    blue_str   = f"{fmt_time(blue_start)}–{fmt_time(blue_end)}"
+
+    if wmo == 2:
+        sky_note = "Partly cloudy — clouds may enhance the colours."
+    else:
+        sky_note = "Clear skies — clean light with warm tones."
+
+    return (
+        f"📷 Photography windows today: Golden hour {golden_str}–{sunset_str} · "
+        f"Blue hour {blue_str}. {sky_note}"
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1598,6 +1881,60 @@ def get_tomorrow_summary(tomorrow_hours: list, tomorrow_aqi: list) -> str:
 # The baseline (historical_avg_temp) is pre-computed by insights.py from
 # past daily_weather rows for the same month.
 # ─────────────────────────────────────────────────────────────────────────────
+
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# INSIGHT NEW — RAIN STREAK
+# Detects 3+ consecutive rainy days from the daily_weather rows.
+# daily_rows is the full 7-day list passed from insights.py.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def insight_rain_streak(daily_rows: list) -> Optional[str]:
+    """
+    Checks if it has rained (precipitation_sum > 1mm) for 3+ consecutive days
+    including today. Uses the daily_weather rows sorted by date ascending.
+    Fires a ground saturation warning — useful for waterproof footwear advice,
+    outdoor activity planning, and flood risk context.
+
+    daily_rows: list of dicts from daily_weather, each with keys:
+        date, precipitation_sum
+    """
+    if not daily_rows:
+        return None
+
+    # Sort ascending by date so we can check consecutive days
+    from datetime import date as _date
+    sorted_rows = sorted(daily_rows, key=lambda r: r.get("date") or _date.min)
+
+    # Count consecutive rainy days ending on the most recent (today or yesterday)
+    streak = 0
+    for row in reversed(sorted_rows):
+        precip = row.get("precipitation_sum") or 0
+        try:
+            precip = float(precip)
+        except (TypeError, ValueError):
+            precip = 0
+
+        if precip >= 1.0:
+            streak += 1
+        else:
+            break  # streak broken
+
+    if streak < 3:
+        return None
+
+    if streak >= 7:
+        return (f"🌧️ {streak}-day rain streak — ground is heavily saturated. "
+                f"Expect standing water and slippery surfaces. Waterproof footwear essential. "
+                f"Avoid low-lying areas prone to flooding.")
+
+    if streak >= 5:
+        return (f"🌧️ {streak} consecutive rainy days — ground is saturated. "
+                f"Puddles and muddy paths likely. Waterproof footwear strongly recommended.")
+
+    return (f"🌧️ Rain for {streak} days in a row — ground is saturated, "
+            f"puddles likely on roads and paths. Waterproof footwear recommended today.")
 
 def detect_anomaly(hours: list, historical_avg_temp: float) -> Optional[str]:
     """
