@@ -121,9 +121,7 @@ def run_scraper(lat: float, lon: float, url: str, user_id: int, area: str):
                 "dust", "uv_index", "uv_index_clear_sky"
             ],
             "hourly": [
-                "pm10", "pm2_5", "carbon_monoxide", "nitrogen_dioxide",
-                "ozone", "sulphur_dioxide", "us_aqi",
-                "dust", "uv_index", "uv_index_clear_sky",
+                "us_aqi", "pm2_5", "ozone",
                 "alder_pollen", "birch_pollen", "grass_pollen"
             ]
         },
@@ -449,38 +447,27 @@ def run_scraper(lat: float, lon: float, url: str, user_id: int, area: str):
     # Always from Open-Meteo. aqi_category is derived from us_aqi via EPA
     # breakpoints for every hourly row since weather.com only gives current AQI.
     ha = aqi["hourly"]
+    # Only store the 6 fields the engine actually uses.
     hourly_aqi_rows = []
     for i in range(len(ha["time"])):
-        us_aqi_val = ha.get("us_aqi", [None])[i]
         hourly_aqi_rows.append((
             user_id, area, run_id,
             ha["time"][i],
-            ha.get("pm10",               [None])[i],
-            ha.get("pm2_5",              [None])[i],
-            ha.get("carbon_monoxide",    [None])[i],
-            ha.get("nitrogen_dioxide",   [None])[i],
-            ha.get("ozone",              [None])[i],
-            ha.get("sulphur_dioxide",    [None])[i],
-            us_aqi_val,
-            get_aqi_category(us_aqi_val),   # EPA category derived from us_aqi for each hour
-            ha.get("dust",               [None])[i],
-            ha.get("uv_index",           [None])[i],
-            ha.get("uv_index_clear_sky", [None])[i],
-            ha.get("alder_pollen",       [None])[i],
-            ha.get("birch_pollen",       [None])[i],
-            ha.get("grass_pollen",       [None])[i],
+            ha.get("us_aqi",       [None])[i],
+            ha.get("pm2_5",        [None])[i],
+            ha.get("ozone",        [None])[i],
+            ha.get("alder_pollen", [None])[i],
+            ha.get("birch_pollen", [None])[i],
+            ha.get("grass_pollen", [None])[i],
         ))
 
     cur.executemany("""
         INSERT INTO hourly_aqi (
             user_id, area, run_id, timestamp,
-            pm10, pm2_5, carbon_monoxide,
-            nitrogen_dioxide, ozone, sulphur_dioxide,
-            us_aqi, aqi_category,
-            dust, uv_index, uv_index_clear_sky,
+            us_aqi, pm2_5, ozone,
             alder_pollen, birch_pollen, grass_pollen
         )
-        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
     """, hourly_aqi_rows)
 
     # ── Cleanup Records Older Than 15 Days ─────────────────────────────────

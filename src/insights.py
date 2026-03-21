@@ -7,8 +7,11 @@ functions in insights_engine.py and alerts_engine.py for calculation.
 
 Public API (called from bot.py):
     await generate_insights(user_id, area)         → full insight string (rest of today)
+    await generate_insights_split(user_id, area)   → (visible_text, hidden_text) tuple
     await generate_alert_message(user_id, area)    → 3-bullet morning alert string
     await generate_tomorrow_forecast(user_id)      → tomorrow summary string
+    await generate_bonus_insights(user_id, area)   → lifestyle insights string or ""
+    await generate_weekly_forecast(user_id)        → (compact_text, days_data)
 
 All functions return fully formatted strings ready to send to Telegram.
 No formatting logic lives here — that lives in the engine files.
@@ -41,7 +44,6 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 # ─────────────────────────────────────────────────────────────────────────────
 
 async def _get_run_id(conn, user_id: int, area: str):
-    """Returns the most recent run_id for this user+area, or None."""
     row = await conn.fetchrow(
         """
         SELECT id FROM scraper_runs
@@ -56,9 +58,6 @@ async def _get_run_id(conn, user_id: int, area: str):
 
 # ─────────────────────────────────────────────────────────────────────────────
 # SHARED HELPER — fetch historical average temperature for anomaly detection
-# Reads past daily_weather rows for this user's area in the current month
-# and returns the mean of temperature_2m_max. Returns None if < 7 rows found
-# (not enough history to make a meaningful comparison).
 # ─────────────────────────────────────────────────────────────────────────────
 
 async def _get_historical_avg(conn, user_id: int, area: str) -> float | None:
@@ -78,24 +77,42 @@ async def _get_historical_avg(conn, user_id: int, area: str) -> float | None:
         """,
         user_id, area, today.month, today
     )
-    if len(rows) < 7:
+    if len(rows) < 5:   # lowered from 7 — more responsive for newer users
         return None
     vals = [r["temperature_2m_max"] for r in rows]
     return sum(vals) / len(vals)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# SHARED HELPER — fetch 7-day daily rows for rain streak detection
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def _get_7day_daily_rows(conn, run_id: int) -> list:
+    """
+    Fetches the last 7 daily_weather rows for this run's area.
+    Used by insight_rain_streak() which needs consecutive rainy days.
+    """
+    today = date.today()
+    rows = await conn.fetch(
+        """
+        SELECT date, precipitation_sum
+        FROM daily_weather
+        WHERE run_id = $1
+          AND date >= $2
+        ORDER BY date ASC
+        LIMIT 7
+        """,
+        run_id, today - timedelta(days=6)
+    )
+    return [dict(r) for r in rows]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # PUBLIC: generate_insights
-# Full insight dump for the rest of today — called when user taps 💡 Insights.
+# Full insight dump for the rest of today — kept for backward compatibility.
 # ─────────────────────────────────────────────────────────────────────────────
 
 async def generate_insights(user_id: int, area: str) -> str:
-    """
-    Main entry point called from bot.py when the user requests insights.
-    Fetches today's remaining hourly data, AQI, daily summary, and current
-    conditions, then passes everything to insights_engine and returns the
-    fully formatted string.
-    """
     conn = await asyncpg.connect(DATABASE_URL, ssl="require")
     try:
         run_id = await _get_run_id(conn, user_id, area)
@@ -158,6 +175,7 @@ async def generate_insights(user_id: int, area: str) -> str:
             """,
             run_id
         )
+        daily_rows_7 = await _get_7day_daily_rows(conn, run_id)
 
     finally:
         await conn.close()
@@ -175,16 +193,11 @@ async def generate_insights(user_id: int, area: str) -> str:
 
 # ─────────────────────────────────────────────────────────────────────────────
 # PUBLIC: generate_insights_split
-# Same DB fetch as generate_insights but returns (visible, hidden) tuple.
-# visible = tier 1+2 (dangerous + rain) always shown immediately.
-# hidden  = tier 3+ shown only when user taps "Show N more…" button.
+# Returns (visible_text, hidden_text) tuple — main path used by bot.py.
+# Fetches 7-day daily rows and passes them to the engine for rain streak.
 # ─────────────────────────────────────────────────────────────────────────────
 
-async def generate_insights_split(user_id: int, area: str) -> tuple[str, str]:
-    """
-    Fetches same data as generate_insights, but calls _engine_insights_split
-    to return (visible_text, hidden_text) so bot.py can show a collapsed view.
-    """
+async def generate_insights_split(user_id: int, area: str) -> tuple:
     conn = await asyncpg.connect(DATABASE_URL, ssl="require")
     try:
         run_id = await _get_run_id(conn, user_id, area)
@@ -241,6 +254,9 @@ async def generate_insights_split(user_id: int, area: str) -> tuple[str, str]:
             FROM current_weather WHERE run_id = $1 LIMIT 1
             """, run_id
         )
+        # 7-day daily rows for rain streak detection
+        daily_rows_7 = await _get_7day_daily_rows(conn, run_id)
+
     finally:
         await conn.close()
 
@@ -252,28 +268,23 @@ async def generate_insights_split(user_id: int, area: str) -> tuple[str, str]:
     daily   = dict(daily_row) if daily_row else {}
     current = dict(current_row) if current_row else {}
 
-    return _engine_insights_split(hours, aqi_h, daily, current)
-# Produces the 3-bullet morning alert string sent at 7 AM by the scheduler.
-# Fetches ALL of today's hourly data (not just remaining), so it works
-# correctly even when called at 7 AM before much of the day has elapsed.
+    return _engine_insights_split(hours, aqi_h, daily, current, daily_rows=daily_rows_7)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PUBLIC: generate_alert_message
+# 3-bullet morning alert — full day's hourly data.
 # ─────────────────────────────────────────────────────────────────────────────
 
 async def generate_alert_message(user_id: int, area: str) -> str:
-    """
-    Called by the 7 AM JobQueue scheduler in bot.py.
-    Fetches the full day's hourly forecast (all hours for today),
-    scores them through alerts_engine, picks the top 3 severity bullets,
-    and returns the formatted morning alert string.
-    """
     conn = await asyncpg.connect(DATABASE_URL, ssl="require")
     try:
         run_id = await _get_run_id(conn, user_id, area)
         if not run_id:
-            return None  # No data — skip this user silently
+            return None
 
         today = date.today()
 
-        # Full day's hourly weather (not filtered by NOW — full day view for morning alert)
         hourly_rows = await conn.fetch(
             """
             SELECT timestamp, temperature_2m, relative_humidity_2m,
@@ -289,8 +300,6 @@ async def generate_alert_message(user_id: int, area: str) -> str:
             """,
             run_id, today
         )
-
-        # Full day's AQI
         aqi_rows = await conn.fetch(
             """
             SELECT timestamp, pm10, pm2_5, ozone, us_aqi,
@@ -302,8 +311,6 @@ async def generate_alert_message(user_id: int, area: str) -> str:
             """,
             run_id, today
         )
-
-        # Daily summary for golden hour and weather_code_max
         daily_row = await conn.fetchrow(
             """
             SELECT date, temperature_2m_max, temperature_2m_min,
@@ -315,12 +322,7 @@ async def generate_alert_message(user_id: int, area: str) -> str:
             """,
             run_id, today
         )
-
-        # Historical average for anomaly detection
         hist_avg = await _get_historical_avg(conn, user_id, area)
-
-        # Current snapshot — carries scraped_aqi_value (weather.com) for
-        # _alert_aqi() to use as the display number instead of raw us_aqi.
         current_row = await conn.fetchrow(
             """
             SELECT us_aqi, scraped_aqi_value, scraped_aqi_category
@@ -348,18 +350,11 @@ async def generate_alert_message(user_id: int, area: str) -> str:
 
 # ─────────────────────────────────────────────────────────────────────────────
 # PUBLIC: generate_tomorrow_forecast
-# Fetches tomorrow's hourly data and returns a compact summary string.
-# Called when user taps the 📅 Tomorrow button in bot.py.
 # ─────────────────────────────────────────────────────────────────────────────
 
 async def generate_tomorrow_forecast(user_id: int) -> str:
-    """
-    Fetches tomorrow's hourly weather and AQI rows and returns a compact
-    tomorrow-forecast string via insights_engine.get_tomorrow_summary().
-    """
     conn = await asyncpg.connect(DATABASE_URL, ssl="require")
     try:
-        # Get latest run for this user (any area — tomorrow doesn't need area filter)
         row = await conn.fetchrow(
             """
             SELECT id, area FROM scraper_runs
@@ -372,7 +367,7 @@ async def generate_tomorrow_forecast(user_id: int) -> str:
         if not row:
             return "⚠️ No data available. Please share your location first."
 
-        run_id = row["id"]
+        run_id   = row["id"]
         tomorrow = date.today() + timedelta(days=1)
 
         hourly_rows = await conn.fetch(
@@ -387,7 +382,6 @@ async def generate_tomorrow_forecast(user_id: int) -> str:
             """,
             run_id, tomorrow
         )
-
         aqi_rows = await conn.fetch(
             """
             SELECT timestamp, us_aqi, pm2_5, ozone
@@ -407,12 +401,9 @@ async def generate_tomorrow_forecast(user_id: int) -> str:
     return get_tomorrow_summary(hours, aqi_h)
 
 
-
 # ─────────────────────────────────────────────────────────────────────────────
 # PUBLIC: generate_weekly_forecast
 # 7-day forecast — compact overview by default, expandable tips per day.
-# Called from bot.py when user taps 📅 7-Day Forecast button.
-# Returns (compact_text, days_data) — bot.py handles the inline expand buttons.
 # ─────────────────────────────────────────────────────────────────────────────
 
 # WMO code → short label + emoji
@@ -428,13 +419,7 @@ _WMO_SHORT = {
 }
 
 
-def _week_tips(row: dict) -> list[str]:
-    """
-    Generates rule-based actionable tips for a single daily_weather row.
-    Tips are ordered by the same priority ranking as the insights engine:
-    Dangerous → Rain → AQI proxy → UV → Wind.
-    Returns a list of tip strings (may be empty).
-    """
+def _week_tips(row: dict) -> list:
     tips = []
     rain = row.get("precipitation_sum") or 0
     uv   = row.get("uv_index_max") or 0
@@ -443,7 +428,6 @@ def _week_tips(row: dict) -> list[str]:
     tmin = row.get("temperature_2m_min") or 0
     wmo  = row.get("weather_code_max") or 0
 
-    # Tier 1 — Dangerous
     if wmo in (95, 96, 99):
         tips.append("⛈️ Thunderstorm possible — avoid open areas")
     if tmax >= 38:
@@ -453,24 +437,20 @@ def _week_tips(row: dict) -> list[str]:
     if tmin <= 10:
         tips.append("🧥 Cold morning — layer up")
 
-    # Tier 2 — Rain (skip if storm already added)
     if wmo not in (95, 96, 99):
         if rain >= 10:
             tips.append(f"☂️ Carry an umbrella ({round(rain)}mm expected)")
         elif rain >= 3:
             tips.append("🌂 Light rain likely — keep an umbrella handy")
 
-    # Tier 3 — AQI proxy (fog/haze only — no daily AQI in DB)
     if wmo in (45, 48):
         tips.append("😷 Foggy — reduced visibility, mask if sensitive")
 
-    # Tier 4 — UV
     if uv >= 8:
         tips.append(f"🧴 Very high UV ({round(uv)}) — sunscreen + hat essential")
     elif uv >= 5:
         tips.append(f"🕶️ Moderate UV ({round(uv)}) — apply sunscreen")
 
-    # Tier 5 — Wind
     if gust >= 60:
         tips.append(f"💨 Strong gusts ({round(gust)} km/h) — secure loose items")
     elif gust >= 40:
@@ -480,7 +460,6 @@ def _week_tips(row: dict) -> list[str]:
 
 
 def _build_compact_line(row: dict, day_label: str) -> str:
-    """Single compact forecast line: 'Mon: 22–34°C ⛅ Partly Cloudy'"""
     tmax = round(row.get("temperature_2m_max") or 0)
     tmin = round(row.get("temperature_2m_min") or 0)
     wmo  = row.get("weather_code_max") or 0
@@ -488,22 +467,7 @@ def _build_compact_line(row: dict, day_label: str) -> str:
     return f"*{day_label}:* {tmin}–{tmax}°C {cond_emoji} {cond_label}"
 
 
-async def generate_weekly_forecast(user_id: int) -> tuple[str, list[dict]]:
-    """
-    Returns (compact_text, days_data) where:
-      - compact_text: 7-line overview to send immediately
-      - days_data: list of dicts {index, label, date_str, tips} used by
-        bot.py to build per-day inline expand buttons and handle
-        weekly_expand_N callbacks.
-
-    Compact format per day (one line):
-      Mon: 22–34°C ⛅ Partly Cloudy
-
-    Expanded format (sent on demand when user taps a day button):
-      📅 Monday (12 Mar) tips:
-        • ☂️ Carry an umbrella (14mm expected)
-        • 🧴 Very high UV (9) — sunscreen + hat essential
-    """
+async def generate_weekly_forecast(user_id: int) -> tuple:
     conn = await asyncpg.connect(DATABASE_URL, ssl="require")
     try:
         row = await conn.fetchrow(
@@ -568,28 +532,26 @@ async def generate_weekly_forecast(user_id: int) -> tuple[str, list[dict]]:
             "label":    day_label,
             "date_str": d.strftime("%a %d %b"),
             "tips":     tips,
-            "row":      r,   # full daily row — used by expand card in bot.py
+            "row":      r,
         })
 
     compact_lines.append("\n_Tap a day below to see tips 👇_")
     return "\n".join(compact_lines), days_data
 
-# Returns the bonus lifestyle insights (best run time, laundry, golden hour,
-# exercise air score, anomaly) as a single formatted string.
-# Called from bot.py when the user has already seen the main insights and
-# wants more context. All 5 checks are optional — None results are filtered.
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PUBLIC: generate_bonus_insights
+# Lifestyle insights — best run time, laundry, golden hour, exercise air, anomaly.
+# Returns "" (empty string) when nothing fires — bot.py checks for empty string,
+# not for a filler message. This eliminates the "Nothing to flag" noise.
 # ─────────────────────────────────────────────────────────────────────────────
 
 async def generate_bonus_insights(user_id: int, area: str) -> str:
-    """
-    Runs the 5 lifestyle-oriented insight functions and returns a formatted
-    string. Designed to be sent as a follow-up to the main insights message.
-    """
     conn = await asyncpg.connect(DATABASE_URL, ssl="require")
     try:
         run_id = await _get_run_id(conn, user_id, area)
         if not run_id:
-            return "⚠️ No data found. Please share your location first."
+            return ""
 
         now   = datetime.now()
         today = date.today()
@@ -628,7 +590,6 @@ async def generate_bonus_insights(user_id: int, area: str) -> str:
             """,
             run_id, today
         )
-
         hist_avg = await _get_historical_avg(conn, user_id, area)
 
     finally:
@@ -638,19 +599,369 @@ async def generate_bonus_insights(user_id: int, area: str) -> str:
     aqi_h = [dict(r) for r in aqi_rows]
     daily = dict(daily_row) if daily_row else {}
 
-    # Order: actionable first, informational last.
-    # get_exercise_air_score suppresses itself if get_best_run_time would fire,
-    # so these two will never produce contradictory messages.
-    best_run      = get_best_run_time(hours, aqi_h)
-    exercise_air  = get_exercise_air_score(hours, aqi_h)
-    laundry       = get_laundry_score(hours)
-    golden        = get_golden_hour(daily)
-    anomaly       = detect_anomaly(hours, hist_avg)
+    best_run     = get_best_run_time(hours, aqi_h)
+    exercise_air = get_exercise_air_score(hours, aqi_h)
+    laundry      = get_laundry_score(hours)
+    golden       = get_golden_hour(daily)
+    anomaly      = detect_anomaly(hours, hist_avg)
 
     results = [r for r in [best_run, exercise_air, laundry, golden, anomaly] if r is not None]
 
     if not results:
-        return "✅ Nothing extra to flag — conditions are well within normal today."
+        return ""  # Empty string — bot.py checks `if bonus:` to decide whether to append
 
-    header = f"🌿 Lifestyle insights for today ({len(results)} tips)\n\n"
+    header = f"🌿 Lifestyle insights ({len(results)} tip{'s' if len(results) > 1 else ''})\n\n"
     return header + "\n\n".join(results)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PUBLIC: generate_ask_response
+# Natural language weather query — user types a question, we answer it using
+# their actual forecast data as context sent to the Claude API.
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def generate_ask_response(user_id: int, area: str, question: str) -> str:
+    """
+    Fetches today's remaining forecast + AQI, builds a compact context block,
+    and calls the Claude API (claude-haiku — fast, cheap) with the user's question.
+    Returns a plain-English answer grounded in real pipeline data.
+    """
+    conn = await asyncpg.connect(DATABASE_URL, ssl="require")
+    try:
+        run_id = await _get_run_id(conn, user_id, area)
+        if not run_id:
+            return "⚠️ No weather data found for your location. Share your location first."
+
+        now   = datetime.now()
+        today = date.today()
+
+        hourly_rows = await conn.fetch(
+            """
+            SELECT timestamp, apparent_temperature, precipitation_probability,
+                   rain, uv_index, is_day, wind_gusts_10m, cloud_cover,
+                   wind_speed_10m, relative_humidity_2m
+            FROM hourly_weather
+            WHERE run_id = $1 AND timestamp >= $2 AND DATE(timestamp) = $3
+            ORDER BY timestamp ASC
+            """,
+            run_id, now, today
+        )
+        aqi_rows = await conn.fetch(
+            """
+            SELECT timestamp, us_aqi, pm2_5, grass_pollen
+            FROM hourly_aqi
+            WHERE run_id = $1 AND timestamp >= $2 AND DATE(timestamp) = $3
+            ORDER BY timestamp ASC
+            """,
+            run_id, now, today
+        )
+        daily_row = await conn.fetchrow(
+            """
+            SELECT temperature_2m_max, temperature_2m_min, sunrise, sunset,
+                   precipitation_sum, wind_gusts_10m_max, uv_index_max
+            FROM daily_weather WHERE run_id = $1 AND date = $2 LIMIT 1
+            """,
+            run_id, today
+        )
+        current_row = await conn.fetchrow(
+            """
+            SELECT temperature_2m, apparent_temperature, scraped_aqi_value,
+                   scraped_aqi_category, us_aqi
+            FROM current_weather WHERE run_id = $1 LIMIT 1
+            """,
+            run_id
+        )
+    finally:
+        await conn.close()
+
+    # Build compact hourly context (max 12 hours to keep prompt small)
+    def _fmt(dt):
+        if dt is None: return "N/A"
+        if isinstance(dt, str):
+            try: dt = datetime.fromisoformat(dt)
+            except: return dt
+        return dt.strftime("%I%p").lstrip("0")
+
+    hours = [dict(r) for r in hourly_rows[:12]]
+    aqi_h = [dict(r) for r in aqi_rows[:12]]
+    daily = dict(daily_row) if daily_row else {}
+    current = dict(current_row) if current_row else {}
+
+    # Build hourly summary lines
+    hourly_lines = []
+    for h in hours:
+        ts = h.get("timestamp")
+        rain_p = round(h.get("precipitation_probability") or 0)
+        app_t = round(h.get("apparent_temperature") or 0)
+        uv = round(h.get("uv_index") or 0, 1)
+        gusts = round(h.get("wind_gusts_10m") or 0)
+        hourly_lines.append(
+            f"  {_fmt(ts)}: feels {app_t}°C, rain {rain_p}%, UV {uv}, gusts {gusts}km/h"
+        )
+
+    # AQI line
+    aqi_val = current.get("scraped_aqi_value") or current.get("us_aqi")
+    aqi_cat = current.get("scraped_aqi_category") or ""
+    aqi_line = f"AQI: {aqi_val} ({aqi_cat})" if aqi_val else "AQI: unavailable"
+
+    # Pollen
+    pollen_vals = []
+    for row in aqi_h:
+        if row.get("grass_pollen"):
+            pollen_vals.append(row["grass_pollen"])
+    pollen_line = f"Grass pollen peak: {round(max(pollen_vals), 1)}" if pollen_vals else ""
+
+    daily_line = ""
+    if daily:
+        tmax = round(daily.get("temperature_2m_max") or 0)
+        tmin = round(daily.get("temperature_2m_min") or 0)
+        rain_sum = round(daily.get("precipitation_sum") or 0, 1)
+        daily_line = f"Today's range: {tmin}–{tmax}°C, total rain: {rain_sum}mm"
+
+    context_block = f"""Location: {area}
+{daily_line}
+{aqi_line}
+{pollen_line}
+
+Hourly forecast (remaining today):
+{chr(10).join(hourly_lines)}
+""".strip()
+
+    # Call Groq API (free, no billing required)
+    import aiohttp as _aiohttp
+    api_key = os.getenv("GROQ_API_KEY")
+    if not api_key:
+        return "⚠️ /ask needs a GROQ_API_KEY in your .env file. Get one free at console.groq.com"
+
+    body = {
+        "model": "llama-3.1-8b-instant",
+        "messages": [
+            {
+                "role": "system",
+                "content": (
+                    "You are SkyUpdate, a weather assistant. Answer using ONLY the forecast "
+                    "data provided. Be direct — give a clear yes/no/time answer when possible, "
+                    "then one sentence of context. Under 3 sentences. No markdown, no bullet points."
+                )
+            },
+            {
+                "role": "user",
+                "content": f"Forecast data:\n{context_block}\n\nQuestion: {question}"
+            }
+        ],
+        "max_tokens": 200,
+        "temperature": 0.3,
+    }
+
+    try:
+        async with _aiohttp.ClientSession() as session:
+            async with session.post(
+                "https://api.groq.com/openai/v1/chat/completions",
+                json=body,
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
+                },
+                timeout=_aiohttp.ClientTimeout(total=15),
+            ) as resp:
+                if resp.status == 429:
+                    return "⚠️ Too many requests — try again in a moment."
+                if resp.status != 200:
+                    err = await resp.text()
+                    print(f"[ASK ERROR] status={resp.status} body={err[:200]}")
+                    return "⚠️ Could not get an answer right now. Try again in a moment."
+                data = await resp.json()
+                answer = data["choices"][0]["message"]["content"].strip()
+                return f"💬 {answer}"
+    except Exception as e:
+        print(f"[ASK ERROR] {e}")
+        return "⚠️ Could not reach the answer service. Try again shortly."
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PUBLIC: generate_radar_chart
+# 8-hour rain probability bar chart as a BytesIO PNG.
+# Built from existing hourly_weather.precipitation_probability — no new API.
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def generate_radar_chart(user_id: int, area: str):
+    """
+    Returns a BytesIO PNG buffer showing rain probability for the next 8 hours.
+    Each bar is colour-coded: green (<30%), yellow (30–59%), orange (60–79%), red (80%+).
+    Returns None if no data is available.
+    """
+    conn = await asyncpg.connect(DATABASE_URL, ssl="require")
+    try:
+        run_id = await _get_run_id(conn, user_id, area)
+        if not run_id:
+            return None, "⚠️ No data found. Share your location first."
+
+        now   = datetime.now()
+        today = date.today()
+
+        rows = await conn.fetch(
+            """
+            SELECT timestamp, precipitation_probability, rain
+            FROM hourly_weather
+            WHERE run_id = $1 AND timestamp >= $2 AND DATE(timestamp) = $3
+            ORDER BY timestamp ASC
+            LIMIT 8
+            """,
+            run_id, now, today
+        )
+    finally:
+        await conn.close()
+
+    if not rows:
+        return None, "⚠️ No hourly forecast data available right now."
+
+    from PIL import Image, ImageDraw, ImageFont
+    from io import BytesIO
+    import os as _os
+
+    hours = [dict(r) for r in rows]
+
+    # ── Layout ─────────────────────────────────────────────────────────────
+    W, H       = 680, 320
+    PAD_L      = 56    # left for y-axis labels
+    PAD_R      = 24
+    PAD_T      = 48    # top for title
+    PAD_B      = 64    # bottom for x labels
+    chart_w    = W - PAD_L - PAD_R
+    chart_h    = H - PAD_T - PAD_B
+    n          = len(hours)
+    bar_gap    = 8
+    bar_w      = (chart_w - bar_gap * (n + 1)) // n
+
+    BG         = (15, 15, 18)
+    GRID       = (40, 40, 52)
+    WHITE      = (255, 255, 255)
+    MUTED      = (110, 112, 130)
+    TITLE_C    = (222, 222, 232)
+
+    def bar_color(prob):
+        if prob >= 80: return (220, 60, 60)
+        if prob >= 60: return (230, 130, 40)
+        if prob >= 30: return (200, 200, 50)
+        return (60, 180, 100)
+
+    img  = Image.new("RGB", (W, H), BG)
+    draw = ImageDraw.Draw(img)
+
+    # Top accent line
+    for i, c in enumerate([(85,150,255),(95,162,255),(108,172,255),(125,182,255)]):
+        draw.rectangle([0, i, W, i+1], fill=c)
+
+    # Try loading font — fall back gracefully
+    _base = _os.path.dirname(_os.path.abspath(__file__))
+    _fonts = _os.path.join(_base, "fonts")
+    def _try_font(name, size):
+        p = _os.path.join(_fonts, name)
+        if _os.path.exists(p):
+            return ImageFont.truetype(p, size)
+        try:
+            return ImageFont.truetype("DejaVuSans.ttf", size)
+        except:
+            return ImageFont.load_default()
+
+    f_title = _try_font("Poppins-Medium.ttf", 22)
+    f_label = _try_font("Poppins-Regular.ttf", 16)
+    f_small = _try_font("Poppins-Light.ttf",   13)
+
+    # Title
+    title = f"Rain forecast — next {n} hours"
+    draw.text((PAD_L, 14), title, font=f_title, fill=TITLE_C)
+
+    # Y-axis grid lines at 0, 25, 50, 75, 100
+    for pct in (0, 25, 50, 75, 100):
+        y = PAD_T + chart_h - int(chart_h * pct / 100)
+        draw.line([(PAD_L, y), (W - PAD_R, y)], fill=GRID, width=1)
+        draw.text((PAD_L - 6, y - 8), f"{pct}%", font=f_small, fill=MUTED,
+                  anchor="rm" if hasattr(draw, 'textlength') else None)
+
+    # Bars
+    for i, h in enumerate(hours):
+        prob   = round(h.get("precipitation_probability") or 0)
+        rain_mm = round(h.get("rain") or 0, 1)
+        x0     = PAD_L + bar_gap + i * (bar_w + bar_gap)
+        x1     = x0 + bar_w
+        bar_px = int(chart_h * prob / 100)
+        y0     = PAD_T + chart_h - bar_px
+        y1     = PAD_T + chart_h
+
+        col = bar_color(prob)
+
+        # Bar body
+        if bar_px > 0:
+            draw.rounded_rectangle([x0, y0, x1, y1], radius=4, fill=col)
+
+        # Prob label on top of bar
+        cx = (x0 + x1) // 2
+        lbl = f"{prob}%"
+        ty = y0 - 20 if bar_px > 24 else PAD_T + chart_h - 24
+        draw.text((cx, ty), lbl, font=f_small, fill=col, anchor="mm" if hasattr(draw, 'textlength') else None)
+
+        # Rain mm below label if notable
+        if rain_mm >= 0.5:
+            draw.text((cx, PAD_T + chart_h + 4), f"~{rain_mm}mm",
+                      font=f_small, fill=MUTED, anchor="mt" if hasattr(draw, 'textlength') else None)
+
+        # Time label
+        ts = h.get("timestamp")
+        if ts:
+            def _fmt_h(dt):
+                if isinstance(dt, str):
+                    try: dt = __import__("datetime").datetime.fromisoformat(dt)
+                    except: return dt
+                return dt.strftime("%I%p").lstrip("0")
+            draw.text((cx, H - PAD_B + 16), _fmt_h(ts),
+                      font=f_label, fill=MUTED, anchor="mt" if hasattr(draw, 'textlength') else None)
+
+    # Legend pills
+    legend = [("< 30%", (60,180,100)), ("30–59%", (200,200,50)),
+              ("60–79%", (230,130,40)), ("80%+", (220,60,60))]
+    lx = PAD_L
+    for label, col in legend:
+        draw.rounded_rectangle([lx, H - 22, lx + 10, H - 12], radius=3, fill=col)
+        draw.text((lx + 14, H - 22), label, font=f_small, fill=MUTED)
+        lx += int(draw.textlength(label, font=f_small) if hasattr(draw, 'textlength') else 60) + 28
+
+    buf = BytesIO()
+    img.save(buf, format="PNG", optimize=True)
+    buf.seek(0)
+    return buf, None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PUBLIC: get_streak_history
+# Returns recent insight_history rows for streak context calculation.
+# Called from bot.py alongside generate_insights_split.
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def get_streak_history(user_id: int, area: str) -> list:
+    """
+    Returns the last 7 insight_history rows for this user+area, sorted DESC.
+    Today's row is not included — the caller has today's active tiers fresh.
+    Returns [] if no history yet (new user / first week).
+    """
+    today = date.today()
+    try:
+        conn = await asyncpg.connect(DATABASE_URL, ssl="require")
+        try:
+            rows = await conn.fetch(
+                """
+                SELECT insight_date, tiers_json
+                FROM insight_history
+                WHERE user_id = $1 AND area = $2
+                  AND insight_date < $3
+                ORDER BY insight_date DESC
+                LIMIT 7
+                """,
+                user_id, area, today
+            )
+            return [dict(r) for r in rows]
+        finally:
+            await conn.close()
+    except Exception as e:
+        print(f"[DB ERROR - get_streak_history] {e}")
+        return []

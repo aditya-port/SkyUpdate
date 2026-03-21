@@ -35,7 +35,11 @@ from insights import (
     generate_tomorrow_forecast,
     generate_weekly_forecast,
     generate_bonus_insights,
+    generate_ask_response,
+    generate_radar_chart,
+    get_streak_history,
 )
+from insights_engine import build_streak_context
 
 # ── Environment ───────────────────────────────────────────────────────────────
 load_dotenv()  # loads .env from project root (src/.env)
@@ -267,7 +271,8 @@ def _build_insights_keyboard(has_more: bool, area: str = "") -> InlineKeyboardMa
         cb_data = f"insights_show_more|{area}"[:64]
         rows.append([InlineKeyboardButton("➕ Show more insights", callback_data=cb_data)])
     rows += [
-        [InlineKeyboardButton("🌤️ See Weather Card",  callback_data="show_weather")],
+        [InlineKeyboardButton("🌤️ See Weather Card",  callback_data="show_weather"),
+         InlineKeyboardButton("🌧️ Rain Chart",         callback_data="radar")],
         [InlineKeyboardButton("📅 Tomorrow forecast",  callback_data="tomorrow"),
          InlineKeyboardButton("📆 7-Day Forecast",     callback_data="weekly_forecast")],
         [InlineKeyboardButton("🏠 Main Menu",          callback_data="main_menu")],
@@ -1253,11 +1258,14 @@ async def _send_main_menu(target, user_id: int, parse_mode: str = "Markdown"):
 
     text = (
         "🌤️ *Welcome to SkyUpdate*\n\n"
-        "Use these commands to get started:\n"
+        "Get started:\n"
         "/sharelocation — share your GPS location\n"
         "/settings — saved locations, alerts, appearance\n\n"
-        "Other commands:\n"
-        "/insights — insights for your last location\n"
+        "Forecast:\n"
+        "/insights — full insights for your location\n"
+        "/radar — 8-hour rain chart\n\n"
+        "/ask <question> — ask anything about your weather\n\n"
+        "More:\n"
         "/stats — your weather check stats\n"
         "/remind — event weather reminder\n"
         "/pause — pause morning alerts\n\n"
@@ -1732,18 +1740,15 @@ async def insights_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         full_insights   = visible + ("\n\n" + hidden if hidden else "")
         full_text       = area_label + full_insights
-        if bonus and not bonus.startswith("✅ Nothing"):
+        if bonus:
             full_text += "\n\n" + bonus
-        # Store triggered tiers in history for streak detection
-        import re as _re
         _tier_map = {"🔥":1,"🚨":1,"⛈":1,"❄":1,"🥶":1,"🌨":1,
                      "🌧":2,"🌦":2,"⚠":3,"😷":3,"🕶":4,"☀":4,"💨":5,"🌬":5}
         _tiers_today = list({v for k,v in _tier_map.items() if k in full_insights})
+        history = await get_streak_history(user.id, area)
         await _store_insight_history(user.id, area, _tiers_today)
-        # Streak context for the most severe active tier
-        if _tiers_today:
-            streak_ctx = await _get_streak_context(user.id, area, min(_tiers_today))
-            full_text += streak_ctx
+        streak_ctx = build_streak_context(history, _tiers_today)
+        full_text += streak_ctx
         await update.callback_query.message.reply_text(
             full_text,
             reply_markup=_build_insights_keyboard(False, area),
@@ -2044,8 +2049,15 @@ async def choice_insights_callback(update: Update, context: ContextTypes.DEFAULT
         )
         full_insights   = visible + ("\n\n" + hidden if hidden else "")
         full_text       = f"{label}\n\n{full_insights}"
-        if bonus and not bonus.startswith("✅ Nothing"):
+        if bonus:
             full_text += "\n\n" + bonus
+        _tier_map = {"🔥":1,"🚨":1,"⛈":1,"❄":1,"🥶":1,"🌨":1,
+                     "🌧":2,"🌦":2,"⚠":3,"😷":3,"🕶":4,"☀":4,"💨":5,"🌬":5}
+        _tiers_today = list({v for k,v in _tier_map.items() if k in full_insights})
+        history = await get_streak_history(user.id, area_string)
+        await _store_insight_history(user.id, area_string, _tiers_today)
+        streak_ctx = build_streak_context(history, _tiers_today)
+        full_text += streak_ctx
         await query.message.reply_text(full_text, reply_markup=_build_insights_keyboard(False, area_string))
     except Exception as e:
         print(f"[ERROR - choice_insights_callback] {e}")
@@ -2660,12 +2672,13 @@ async def resume_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def insights_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
+    msg  = update.effective_message
     await log_activity(user, "insights_command")
     await upsert_customer(user)
 
     area = await get_user_last_area(user.id)
     if not area:
-        await update.message.reply_text("⚠️ No location found. Please share your location first.")
+        await msg.reply_text("⚠️ No location found. Please share your location first.")
         return
 
     try:
@@ -2676,20 +2689,108 @@ async def insights_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         full_insights   = visible + ("\n\n" + hidden if hidden else "")
         full_text       = area_label + full_insights
-        if bonus and not bonus.startswith("✅ Nothing"):
+        if bonus:
             full_text += "\n\n" + bonus
-        await update.message.reply_text(
+        await msg.reply_text(
             full_text,
             reply_markup=_build_insights_keyboard(False, area),
         )
     except Exception as e:
         print(f"[ERROR - insights_command] user={user.id} error={e}")
-        await update.message.reply_text("⚠️ Couldn't load insights right now.")
+        await msg.reply_text("⚠️ Couldn't load insights right now.")
 
 
 async def locations_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     await _show_saved_locations(update.message, user.id)
+
+
+async def ask_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/ask <question> — natural language weather query answered by AI."""
+    user = update.effective_user
+    msg  = update.effective_message
+    await log_activity(user, "ask_command")
+    await upsert_customer(user)
+
+    question = " ".join(context.args).strip() if context.args else ""
+    if not question:
+        await msg.reply_text(
+            "💬 Just write your question after /ask\n\nExample: /ask will it rain before 6pm?",
+            parse_mode="Markdown",
+        )
+        return
+
+    area = await get_user_last_area(user.id)
+    if not area:
+        await msg.reply_text("⚠️ No location found. Share your location first.")
+        return
+
+    thinking = await msg.reply_text("💭 Thinking...")
+    try:
+        answer = await generate_ask_response(user.id, area, question)
+        await thinking.edit_text(answer)
+    except Exception as e:
+        print(f"[ERROR - ask_command] user={user.id} error={e}")
+        await thinking.edit_text("⚠️ Couldn't answer that right now. Try again shortly.")
+
+
+async def radar_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/radar — 8-hour rain probability chart."""
+    user = update.effective_user
+    msg  = update.effective_message
+    await log_activity(user, "radar_command")
+    await upsert_customer(user)
+
+    area = await get_user_last_area(user.id)
+    if not area:
+        await msg.reply_text("⚠️ No location found. Share your location first.")
+        return
+
+    thinking = await msg.reply_text("📊 Building rain chart...")
+    try:
+        buf, err = await generate_radar_chart(user.id, area)
+        if err:
+            await thinking.edit_text(err)
+            return
+        short_area = area.split(",")[0].strip()
+        await thinking.delete()
+        await msg.reply_photo(
+            photo=buf,
+            caption=f"🌧️ *Rain forecast — {short_area}*\nNext 8 hours",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("💡 Full Insights", callback_data="insights"),
+                InlineKeyboardButton("📅 Tomorrow",      callback_data="tomorrow"),
+            ]]),
+        )
+    except Exception as e:
+        print(f"[ERROR - radar_command] user={user.id} error={e}")
+        await thinking.edit_text("⚠️ Couldn't build the chart right now. Try again shortly.")
+
+
+async def radar_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Inline 🌧️ Rain Chart button."""
+    user  = update.effective_user
+    query = update.callback_query
+    await query.answer("📊 Building rain chart…")
+    area = await get_user_last_area(user.id)
+    if not area:
+        await query.message.reply_text("⚠️ No location found. Share your location first.")
+        return
+    try:
+        buf, err = await generate_radar_chart(user.id, area)
+        if err:
+            await query.message.reply_text(err)
+            return
+        short_area = area.split(",")[0].strip()
+        await query.message.reply_photo(
+            photo=buf,
+            caption=f"🌧️ *Rain forecast — {short_area}*\nNext 8 hours",
+            parse_mode="Markdown",
+        )
+    except Exception as e:
+        print(f"[ERROR - radar_callback] user={user.id} error={e}")
+        await query.message.reply_text("⚠️ Couldn't build the chart right now.")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -3129,7 +3230,13 @@ async def send_weekly_digest(context: ContextTypes.DEFAULT_TYPE):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def main():
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
+    from telegram.request import HTTPXRequest
+    app = (
+        ApplicationBuilder()
+        .token(BOT_TOKEN)
+        .request(HTTPXRequest(connect_timeout=30, read_timeout=30, write_timeout=30))
+        .build()
+    )
 
     # ── Conversation: save location nickname ──────────────────────────────
     nickname_conv = ConversationHandler(
@@ -3140,6 +3247,7 @@ def main():
             ]
         },
         fallbacks=[CommandHandler("cancel", cancel_nickname)],
+        per_message=False,
     )
 
     # ── Conversation: /remind event weather ───────────────────────────────
@@ -3167,6 +3275,8 @@ def main():
     app.add_handler(CommandHandler("resume",         resume_command))
     app.add_handler(CommandHandler("settings",       settings_command))
     app.add_handler(CommandHandler("appearance",     appearance_command))
+    app.add_handler(CommandHandler("ask",            ask_command))
+    app.add_handler(CommandHandler("radar",          radar_command))
     app.add_handler(CallbackQueryHandler(settings_callback,          pattern="^settings_"))
     app.add_handler(CallbackQueryHandler(appearance_choice_callback, pattern="^appearance_"))
 
@@ -3184,6 +3294,7 @@ def main():
     app.add_handler(CallbackQueryHandler(choice_weather_callback,     pattern="^choice_weather\\|"))
     app.add_handler(CallbackQueryHandler(choice_insights_callback,    pattern="^choice_insights\\|"))
     app.add_handler(CallbackQueryHandler(show_weather_callback,       pattern="^show_weather$"))
+    app.add_handler(CallbackQueryHandler(radar_callback,               pattern="^radar$"))
     app.add_handler(CallbackQueryHandler(feedback_callback,           pattern="^feedback_"))
     app.add_handler(CallbackQueryHandler(save_location_prompt,        pattern="^save_location$"))
     app.add_handler(CallbackQueryHandler(manage_location_callback,    pattern="^manage_loc_"))
@@ -3238,8 +3349,18 @@ def main():
         name="rain_proximity",
     )
 
+    async def _error_handler(update, context):
+        import traceback
+        print(f"\n[ERROR] {type(context.error).__name__}: {context.error}")
+        traceback.print_exception(type(context.error), context.error, context.error.__traceback__)
+    app.add_error_handler(_error_handler)
+
     print("🤖 SkyUpdate bot is running...")
-    app.run_polling()
+    app.run_polling(
+        drop_pending_updates=True,
+        bootstrap_retries=0,   # fail fast — show the real error immediately
+        close_loop=False,      # don't close the loop on exit (Windows fix)
+    )
 
 
 if __name__ == "__main__":
