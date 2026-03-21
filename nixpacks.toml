@@ -1,3 +1,10 @@
 [phases.setup]
 nixPkgs = ["python311"]
 aptPkgs = ["libpq-dev", "gcc"]
+```
+
+Then push:
+```
+git add nixpacks.toml
+git commit -m "pin Python 3.11 fix Railway build"
+git push
