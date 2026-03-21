@@ -1,9 +1,3 @@
 [phases.setup]
+nixPkgs = ["python311"]
 aptPkgs = ["libpq-dev", "gcc"]
-```
-
-Then push:
-```
-git add nixpacks.toml
-git commit -m "fix libpq dependency for psycopg2 on Railway"
-git push -u origin master:main
