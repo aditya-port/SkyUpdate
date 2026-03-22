@@ -932,6 +932,230 @@ async def generate_radar_chart(user_id: int, area: str):
     return buf, None
 
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PUBLIC: generate_temp_chart
+# Temperature / feels-like curve for today as a BytesIO PNG line chart.
+# Shows apparent_temperature for all hours today from hourly_weather.
+# Colour zones: blue <15°C, green 15-28°C, orange 28-38°C, red >38°C
+# Marks current time, sunrise, and sunset as vertical lines.
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def generate_temp_chart(user_id: int, area: str):
+    """
+    Returns (BytesIO PNG, None) on success or (None, error_str) on failure.
+    Shows feels-like temperature curve for today with colour-coded zones,
+    current time marker, and sunrise/sunset markers.
+    """
+    conn = await asyncpg.connect(DATABASE_URL, ssl="require")
+    try:
+        run_id = await _get_run_id(conn, user_id, area)
+        if not run_id:
+            return None, "⚠️ No data found. Share your location first."
+
+        today = date.today()
+        now   = datetime.now()
+
+        rows = await conn.fetch(
+            """
+            SELECT timestamp, apparent_temperature, temperature_2m,
+                   uv_index, is_day, precipitation_probability
+            FROM hourly_weather
+            WHERE run_id = $1 AND DATE(timestamp) = $2
+            ORDER BY timestamp ASC
+            """,
+            run_id, today
+        )
+        daily = await conn.fetchrow(
+            """
+            SELECT sunrise, sunset, temperature_2m_max, temperature_2m_min,
+                   apparent_temperature_max, apparent_temperature_min
+            FROM daily_weather WHERE run_id = $1 AND date = $2 LIMIT 1
+            """,
+            run_id, today
+        )
+    finally:
+        await conn.close()
+
+    if not rows:
+        return None, "⚠️ No hourly data available for today."
+
+    from PIL import Image, ImageDraw, ImageFont
+    from io import BytesIO
+    import os as _os, math as _math
+
+    hours = [dict(r) for r in rows]
+    daily = dict(daily) if daily else {}
+
+    # ── Layout ─────────────────────────────────────────────────────────────
+    W, H    = 720, 340
+    PAD_L   = 58   # left for y-axis labels
+    PAD_R   = 28
+    PAD_T   = 52   # top for title
+    PAD_B   = 56   # bottom for x labels
+    cw      = W - PAD_L - PAD_R
+    ch      = H - PAD_T - PAD_B
+    n       = len(hours)
+
+    BG      = (15, 15, 18)
+    GRID    = (38, 38, 50)
+    WHITE   = (255, 255, 255)
+    MUTED   = (108, 110, 130)
+    TITLE_C = (222, 222, 232)
+    NOW_C   = (255, 220, 80)    # current time marker
+    SR_C    = (255, 185, 65)    # sunrise
+    SS_C    = (100, 140, 255)   # sunset
+
+    def temp_color(t):
+        if t is None: return (110, 112, 130)
+        if t >= 38:   return (220, 60, 60)
+        if t >= 28:   return (230, 130, 40)
+        if t >= 15:   return (60, 180, 100)
+        return (80, 140, 230)
+
+    img  = Image.new("RGB", (W, H), BG)
+    draw = ImageDraw.Draw(img)
+
+    # Top accent
+    for i, c in enumerate([(85,150,255),(95,162,255),(108,172,255),(125,182,255)]):
+        draw.rectangle([0, i, W, i+1], fill=c)
+
+    _base  = _os.path.dirname(_os.path.abspath(__file__))
+    _fonts = _os.path.join(_base, "fonts")
+    def _try_font(name, size):
+        p = _os.path.join(_fonts, name)
+        if _os.path.exists(p):
+            return ImageFont.truetype(p, size)
+        try: return ImageFont.truetype("DejaVuSans.ttf", size)
+        except: return ImageFont.load_default()
+
+    f_title = _try_font("Poppins-Medium.ttf", 20)
+    f_label = _try_font("Poppins-Regular.ttf", 14)
+    f_small = _try_font("Poppins-Light.ttf",   12)
+
+    # Gather temps
+    temps = [h.get("apparent_temperature") for h in hours]
+    valid_temps = [t for t in temps if t is not None]
+    if not valid_temps:
+        return None, "⚠️ No temperature data available."
+
+    t_min = min(valid_temps) - 2
+    t_max = max(valid_temps) + 2
+    t_range = max(t_max - t_min, 1)
+
+    def x_pos(i):
+        return PAD_L + int(i / max(n-1, 1) * cw)
+
+    def y_pos(t):
+        if t is None: return PAD_T + ch // 2
+        return PAD_T + ch - int((t - t_min) / t_range * ch)
+
+    # Title
+    short = area.split(",")[0].strip()
+    tmax_val = daily.get("apparent_temperature_max")
+    tmin_val = daily.get("apparent_temperature_min")
+    range_str = f"  ·  {round(tmin_val)}°–{round(tmax_val)}°C" if tmax_val and tmin_val else ""
+    draw.text((PAD_L, 14), f"Temperature today — {short}{range_str}", font=f_title, fill=TITLE_C)
+
+    # Y-axis grid lines
+    step = 5
+    y_start = int(t_min // step) * step
+    for temp_tick in range(y_start, int(t_max) + step, step):
+        yy = y_pos(temp_tick)
+        if PAD_T <= yy <= PAD_T + ch:
+            draw.line([(PAD_L, yy), (W - PAD_R, yy)], fill=GRID, width=1)
+            draw.text((PAD_L - 6, yy - 8), f"{temp_tick}°",
+                      font=f_small, fill=MUTED, anchor="rm")
+
+    # X-axis labels (every 3 hours)
+    for i, h in enumerate(hours):
+        ts = h.get("timestamp")
+        if ts and (i == 0 or ts.hour % 3 == 0):
+            xx = x_pos(i)
+            label = ts.strftime("%-I%p").lower() if hasattr(ts, 'strftime') else str(i)
+            draw.text((xx, PAD_T + ch + 10), label, font=f_small, fill=MUTED, anchor="mm")
+
+    # Sunrise/sunset vertical lines
+    def _parse_iso(v):
+        if v is None: return None
+        if isinstance(v, str):
+            try:
+                from datetime import datetime as _dt
+                return _dt.fromisoformat(v)
+            except: return None
+        return v
+
+    sr = _parse_iso(daily.get("sunrise"))
+    ss = _parse_iso(daily.get("sunset"))
+
+    for dt_mark, col, label in [(sr, SR_C, "🌅"), (ss, SS_C, "🌇")]:
+        if dt_mark and dt_mark.date() == today:
+            frac = (dt_mark.hour * 60 + dt_mark.minute) / (24 * 60)
+            xm   = PAD_L + int(frac * cw)
+            draw.line([(xm, PAD_T), (xm, PAD_T + ch)], fill=col, width=1)
+            draw.text((xm, PAD_T - 4), label, font=f_small, fill=col, anchor="mm")
+
+    # Current time vertical line
+    now_frac = (now.hour * 60 + now.minute) / (24 * 60)
+    now_x    = PAD_L + int(now_frac * cw)
+    draw.line([(now_x, PAD_T), (now_x, PAD_T + ch)], fill=NOW_C, width=2)
+    draw.text((now_x, PAD_T + ch + 32), "now", font=f_small, fill=NOW_C, anchor="mm")
+
+    # Draw filled area under the line
+    poly_pts = [(PAD_L, PAD_T + ch)]
+    for i, h in enumerate(hours):
+        t = h.get("apparent_temperature")
+        poly_pts.append((x_pos(i), y_pos(t)))
+    poly_pts.append((x_pos(n-1), PAD_T + ch))
+
+    # Soft fill
+    fill_img  = Image.new("RGB", (W, H), BG)
+    fill_draw = ImageDraw.Draw(fill_img)
+    fill_draw.polygon(poly_pts, fill=(40, 80, 60))
+    # Blend fill lightly
+    from PIL import Image as _PIL
+    img = _PIL.blend(img, fill_img, 0.25)
+    draw = ImageDraw.Draw(img)
+
+    # Draw line segments coloured by temperature
+    for i in range(n - 1):
+        t1 = hours[i].get("apparent_temperature")
+        t2 = hours[i+1].get("apparent_temperature")
+        if t1 is None or t2 is None:
+            continue
+        avg_t = (t1 + t2) / 2
+        col   = temp_color(avg_t)
+        x1, y1 = x_pos(i),   y_pos(t1)
+        x2, y2 = x_pos(i+1), y_pos(t2)
+        draw.line([(x1, y1), (x2, y2)], fill=col, width=3)
+
+    # Dot at current hour
+    now_hour = now.hour
+    cur_rows = [h for h in hours if hasattr(h.get("timestamp"), "hour") and h["timestamp"].hour == now_hour]
+    if cur_rows:
+        ct = cur_rows[0].get("apparent_temperature")
+        if ct is not None:
+            ci = hours.index(cur_rows[0])
+            cx, cy = x_pos(ci), y_pos(ct)
+            col = temp_color(ct)
+            draw.ellipse([cx-6, cy-6, cx+6, cy+6], fill=col, outline=WHITE, width=2)
+            draw.text((cx, cy - 16), f"{round(ct)}°C", font=f_label, fill=col, anchor="mm")
+
+    # Colour legend bottom right
+    legend = [("< 15°C", (80,140,230)), ("15–28°C", (60,180,100)),
+              ("28–38°C", (230,130,40)), ("> 38°C", (220,60,60))]
+    lx = W - PAD_R - 4
+    ly = PAD_T + 4
+    for lbl, lcol in reversed(legend):
+        draw.text((lx, ly), f"■ {lbl}", font=f_small, fill=lcol, anchor="rm")
+        ly += 16
+
+    buf = BytesIO()
+    img.save(buf, format="PNG", optimize=True)
+    buf.seek(0)
+    return buf, None
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # PUBLIC: get_streak_history
 # Returns recent insight_history rows for streak context calculation.

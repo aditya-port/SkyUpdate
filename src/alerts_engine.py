@@ -121,15 +121,44 @@ def _alert_heat(hours: list):
     valid = [h for h in hours if h.get("apparent_temperature") is not None]
     if not valid:
         return None
-    peak = max(valid, key=lambda h: h["apparent_temperature"])
-    val = round(peak["apparent_temperature"], 1)
-    if val < 35:
-        return None
-    if val >= 42:
-        return (10, f"🔥 Dangerous heat — feels like {val}°C around {_fmt(peak['timestamp'])}. Avoid going outside.")
-    if val >= 38:
-        return (7, f"🌡️ Intense heat — feels like up to {val}°C. Stay hydrated and limit outdoor time.")
-    return (5, f"☀️ Warm afternoon — feels like {val}°C around {_fmt(peak['timestamp'])}. Drink water regularly.")
+    peak     = max(valid, key=lambda h: h["apparent_temperature"])
+    val      = round(peak["apparent_temperature"], 1)
+    peak_t   = _fmt(peak["timestamp"])
+
+    # Find the dangerous window (hours ≥ threshold)
+    if val >= 35:
+        hot_hours = [h for h in valid if h.get("apparent_temperature", 0) >= 33]
+        if len(hot_hours) >= 2:
+            window = f"{_fmt(hot_hours[0]['timestamp'])}–{_fmt(hot_hours[-1]['timestamp'])}"
+        else:
+            window = peak_t
+        msg = (
+            f"🔥 Dangerous heat — feels like {val}°C (peak around {peak_t})\n"
+            f"⛔ Stay indoors {window} — outdoor exposure is dangerous\n"
+            f"💧 Drink water every 20 min if you must go out\n"
+            f"🧴 SPF 50+ + hat + light loose clothing essential\n"
+            f"🌬️ Keep fans/AC running — overnight low may stay above 28°C"
+        )
+        return (10, msg)
+
+    if val >= 32:
+        msg = (
+            f"🌡️ Intense heat — feels like up to {val}°C around {peak_t}\n"
+            f"💧 Stay hydrated — drink at least 3L water today\n"
+            f"🧴 Apply SPF 50+ before going outside\n"
+            f"🏠 Limit outdoor time between 11AM–4PM"
+        )
+        return (7, msg)
+
+    if val >= 29:
+        msg = (
+            f"☀️ Warm afternoon — feels like {val}°C around {peak_t}\n"
+            f"💧 Drink water regularly and apply SPF 30+\n"
+            f"👕 Wear light breathable clothing"
+        )
+        return (5, msg)
+
+    return None
 
 
 def _alert_heat_stress(hours: list):
@@ -152,15 +181,35 @@ def _alert_uv(hours: list):
     valid = [h for h in hours if h.get("uv_index") is not None and h.get("is_day", 0) == 1]
     if not valid:
         return None
-    peak = max(valid, key=lambda h: h["uv_index"])
-    val = round(peak["uv_index"], 1)
+    peak     = max(valid, key=lambda h: h["uv_index"])
+    val      = round(peak["uv_index"], 1)
+    peak_t   = _fmt(peak["timestamp"])
+    # Find UV peak window
+    high_uv  = [h for h in valid if h.get("uv_index", 0) >= max(val * 0.8, 6)]
+    if len(high_uv) >= 2:
+        uv_window = f"{_fmt(high_uv[0]['timestamp'])}–{_fmt(high_uv[-1]['timestamp'])}"
+    else:
+        uv_window = peak_t
+
     if val < 5:
         return None
     if val >= 11:
-        return (10, f"🚨 Extreme UV ({val}) around {_fmt(peak['timestamp'])}. Avoid being outside entirely.")
+        return (10, (
+            f"🚨 Extreme UV index {val} — peak around {peak_t}\n"
+            f"⛔ Avoid being outside {uv_window} entirely\n"
+            f"🧴 SPF 50+ mandatory — reapply every 2 hours\n"
+            f"🕶️ UV-protective sunglasses + full-sleeve clothing"
+        ))
     if val >= 8:
-        return (7, f"🕶️ Very high UV ({val}) — wear SPF 50+, hat, and seek shade during peak hours.")
-    return (5, f"☀️ High UV ({val}) around {_fmt(peak['timestamp'])}. Apply SPF 30+ before going out.")
+        return (7, (
+            f"🕶️ Very high UV {val} — peak {uv_window}\n"
+            f"🧴 Wear SPF 50+, reapply after sweating\n"
+            f"🧢 Hat and seek shade between 10AM–3PM"
+        ))
+    return (5, (
+        f"☀️ High UV {val} around {peak_t}\n"
+        f"🧴 Apply SPF 30+ before going out"
+    ))
 
 
 def _alert_wind(hours: list):

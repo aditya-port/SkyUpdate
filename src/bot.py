@@ -37,6 +37,7 @@ from insights import (
     generate_bonus_insights,
     generate_ask_response,
     generate_radar_chart,
+    generate_temp_chart,
     get_streak_history,
 )
 from insights_engine import build_streak_context
@@ -66,6 +67,8 @@ async def get_pool():
 NICKNAME_WAITING  = 1   # Waiting for user to type a saved-location nickname
 EVENT_NAME_WAITING = 2  # Waiting for event name in /remind flow
 EVENT_DATE_WAITING = 3  # Waiting for event date in /remind flow
+EVENT_TIME_WAITING = 4  # Waiting for event time (same-day reminder)
+EVENT_MSG_WAITING  = 5  # Waiting for custom reminder message
 
 # ── WMO code dictionaries ─────────────────────────────────────────────────────
 WMO_CODES = {
@@ -271,9 +274,10 @@ def _build_insights_keyboard(has_more: bool, area: str = "") -> InlineKeyboardMa
         cb_data = f"insights_show_more|{area}"[:64]
         rows.append([InlineKeyboardButton("➕ Show more insights", callback_data=cb_data)])
     rows += [
-        [InlineKeyboardButton("🌤️ See Weather Card",  callback_data="show_weather"),
-         InlineKeyboardButton("🌧️ Rain Chart",         callback_data="radar")],
-        [InlineKeyboardButton("📅 Tomorrow forecast",  callback_data="tomorrow"),
+        [InlineKeyboardButton("🌤️ Weather Card",       callback_data="show_weather"),
+         InlineKeyboardButton("🌧️ Rain",               callback_data="rain"),
+         InlineKeyboardButton("🌡️ Temp",               callback_data="sun")],
+        [InlineKeyboardButton("📅 Tomorrow",           callback_data="tomorrow"),
          InlineKeyboardButton("📆 7-Day Forecast",     callback_data="weekly_forecast")],
         [InlineKeyboardButton("🏠 Main Menu",          callback_data="main_menu")],
     ]
@@ -1263,7 +1267,8 @@ async def _send_main_menu(target, user_id: int, parse_mode: str = "Markdown"):
         "/settings — saved locations, alerts, appearance\n\n"
         "Forecast:\n"
         "/insights — full insights for your location\n"
-        "/radar — 8-hour rain chart\n\n"
+        "/rain — 8-hour rain chart\n"
+        "/sun — temperature chart for today\n\n"
         "/ask <question> — ask anything about your weather\n\n"
         "More:\n"
         "/stats — your weather check stats\n"
@@ -2389,50 +2394,127 @@ async def cancel_nickname(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def remind_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Entry point: /remind — asks for the event name."""
     await update.message.reply_text(
-        "📅 What's the event? (e.g. *Wedding*, *Match*, *Trek*)",
+        "📅 What's the event?\n\nExamples: *Wedding*, *Match*, *Doctor appointment*, *Trek*",
         parse_mode="Markdown",
     )
     return EVENT_NAME_WAITING
 
 
 async def remind_receive_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Receives the event name, then asks for the date."""
+    """Receives event name, asks for date with smart shortcuts."""
     name = update.message.text.strip()
-    if not name or len(name) > 50:
-        await update.message.reply_text("❌ Keep it under 50 characters please.")
+    if not name or len(name) > 60:
+        await update.message.reply_text("❌ Keep the name under 60 characters.")
         return EVENT_NAME_WAITING
 
     context.user_data["remind_event_name"] = name
     await update.message.reply_text(
-        f"Got it — *{name}*!\n\nWhat date? (send in format *DD-MM-YYYY*)",
+        f"Got it — *{name}*!\n\n"
+        f"When is it? You can say:\n"
+        f"• *today* or *tomorrow*\n"
+        f"• A date like *25-12-2025*",
         parse_mode="Markdown",
     )
     return EVENT_DATE_WAITING
 
 
 async def remind_receive_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Receives the event date, saves the reminder, confirms."""
-    user      = update.effective_user
-    text      = update.message.text.strip()
+    """Receives date — accepts today/tomorrow/DD-MM-YYYY. If today, asks for time."""
+    user       = update.effective_user
+    text       = update.message.text.strip().lower()
     event_name = context.user_data.get("remind_event_name", "Event")
+    today      = datetime.date.today()
 
-    try:
-        event_date = datetime.datetime.strptime(text, "%d-%m-%Y").date()
-    except ValueError:
-        await update.message.reply_text(
-            "❌ Invalid date format. Please send as DD-MM-YYYY (e.g. 25-12-2025)."
-        )
+    if text == "today":
+        event_date = today
+    elif text == "tomorrow":
+        event_date = today + datetime.timedelta(days=1)
+    else:
+        try:
+            event_date = datetime.datetime.strptime(text, "%d-%m-%Y").date()
+        except ValueError:
+            await update.message.reply_text(
+                "❌ Didn't understand that. Say *today*, *tomorrow*, or a date like *25-12-2025*.",
+                parse_mode="Markdown",
+            )
+            return EVENT_DATE_WAITING
+
+    if event_date < today:
+        await update.message.reply_text("❌ That date is in the past. Please send a future date.")
         return EVENT_DATE_WAITING
 
-    if event_date <= datetime.date.today():
-        await update.message.reply_text(
-            "❌ That date is in the past. Please send a future date."
-        )
-        return EVENT_DATE_WAITING
+    context.user_data["remind_event_date"] = event_date.isoformat()
 
-    # Get the user's area from their most recent run
+    # If today — ask for time so we can send at the right moment
+    if event_date == today:
+        await update.message.reply_text(
+            f"⏰ *{event_name}* is today! What time should I remind you?\n\n"
+            f"Reply with a time like *3:00 PM*, *15:30*, or *now*.",
+            parse_mode="Markdown",
+        )
+        return EVENT_TIME_WAITING
+
+    # Future date — ask for custom message
+    await update.message.reply_text(
+        f"📝 What should the reminder say?\n\n"
+        f"This is the exact message I'll send you on *{event_date.strftime('%d %B %Y')}*.\n"
+        f"Example: *Don't forget your tickets and sunscreen!*\n\n"
+        f"Or send /skip to use the default reminder.",
+        parse_mode="Markdown",
+    )
+    return EVENT_MSG_WAITING
+
+
+async def remind_receive_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Receives time for same-day reminder, then asks for custom message."""
+    import re as _re
+    text = update.message.text.strip().lower()
+    now  = datetime.datetime.now()
+
+    if text == "now":
+        remind_time = now.time().replace(second=0, microsecond=0)
+    else:
+        # Try HH:MM or H:MM AM/PM
+        m = _re.match(r'^(\d{1,2}):(\d{2})\s*(am|pm)?$', text)
+        if not m:
+            await update.message.reply_text(
+                "❌ Couldn't read that time. Try *3:30 PM* or *15:30*.",
+                parse_mode="Markdown",
+            )
+            return EVENT_TIME_WAITING
+        h, mi = int(m.group(1)), int(m.group(2))
+        ampm = m.group(3)
+        if ampm == "pm" and h != 12: h += 12
+        if ampm == "am" and h == 12: h = 0
+        if not (0 <= h <= 23 and 0 <= mi <= 59):
+            await update.message.reply_text("❌ Invalid time. Try again.")
+            return EVENT_TIME_WAITING
+        remind_time = datetime.time(h, mi)
+
+    context.user_data["remind_event_time"] = remind_time.strftime("%H:%M")
+
+    await update.message.reply_text(
+        f"📝 What should the reminder say?\n\n"
+        f"This is the exact message I'll send you at *{remind_time.strftime('%I:%M %p').lstrip('0')}*\n"
+        f"Example: *Time to leave for the match!*\n\n"
+        f"Or send /skip to use just the event name.",
+        parse_mode="Markdown",
+    )
+    return EVENT_MSG_WAITING
+
+
+async def remind_receive_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Receives the custom message, saves the full reminder."""
+    user       = update.effective_user
+    text       = update.message.text.strip()
+    event_name = context.user_data.get("remind_event_name", "Event")
+    event_date = datetime.date.fromisoformat(context.user_data.get("remind_event_date", datetime.date.today().isoformat()))
+    remind_time_str = context.user_data.get("remind_event_time")
+
+    # /skip command is handled by ConversationHandler fallback — but if user types it as text
+    custom_msg = None if text.startswith("/skip") else text[:500]
+
     area = await get_user_last_area(user.id)
-
     async with (await get_pool()).acquire() as conn:
         lat_row = await conn.fetchrow(
             "SELECT lat, lon FROM user_activity WHERE user_id = $1 AND lat IS NOT NULL ORDER BY timestamp DESC LIMIT 1",
@@ -2441,19 +2523,42 @@ async def remind_receive_date(update: Update, context: ContextTypes.DEFAULT_TYPE
         lat = lat_row["lat"] if lat_row else None
         lon = lat_row["lon"] if lat_row else None
 
-        await conn.execute(
-            """
-            INSERT INTO event_reminders (user_id, event_name, event_date, area, lat, lon)
-            VALUES ($1, $2, $3, $4, $5, $6)
-            """,
-            user.id, event_name, event_date, area, lat, lon,
+        # Store remind_time and custom_msg — columns may need adding via migration
+        # We use a try/except to gracefully handle missing columns in older DBs
+        try:
+            await conn.execute(
+                """
+                INSERT INTO event_reminders
+                    (user_id, event_name, event_date, area, lat, lon, remind_time, custom_message)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                """,
+                user.id, event_name, event_date, area, lat, lon,
+                remind_time_str, custom_msg,
+            )
+        except Exception:
+            # Fallback: insert without new columns (older DB schema)
+            await conn.execute(
+                """
+                INSERT INTO event_reminders (user_id, event_name, event_date, area, lat, lon)
+                VALUES ($1, $2, $3, $4, $5, $6)
+                """,
+                user.id, event_name, event_date, area, lat, lon,
+            )
+
+    today = datetime.date.today()
+    if event_date == today and remind_time_str:
+        confirm = (
+            f"✅ Reminder set! I'll message you at *{remind_time_str}* today\n"
+            f"📌 *{event_name}*"
+        )
+    else:
+        confirm = (
+            f"✅ Reminder set for *{event_date.strftime('%d %B %Y')}*\n"
+            f"📌 *{event_name}*\n\n"
+            f"I'll send you a heads-up the evening before and on the day."
         )
 
-    await update.message.reply_text(
-        f"✅ Reminder set! I'll send you a weather forecast for *{event_name}* "
-        f"on *{event_date.strftime('%d %B %Y')}* the day before.",
-        parse_mode="Markdown",
-    )
+    await update.message.reply_text(confirm, parse_mode="Markdown")
     return ConversationHandler.END
 
 
@@ -2734,11 +2839,11 @@ async def ask_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await thinking.edit_text("⚠️ Couldn't answer that right now. Try again shortly.")
 
 
-async def radar_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/radar — 8-hour rain probability chart."""
+async def rain_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/rain — 8-hour rain probability chart."""
     user = update.effective_user
     msg  = update.effective_message
-    await log_activity(user, "radar_command")
+    await log_activity(user, "rain_command")
     await upsert_customer(user)
 
     area = await get_user_last_area(user.id)
@@ -2760,16 +2865,16 @@ async def radar_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup([[
                 InlineKeyboardButton("💡 Full Insights", callback_data="insights"),
-                InlineKeyboardButton("📅 Tomorrow",      callback_data="tomorrow"),
+                InlineKeyboardButton("🌡️ Temp Chart",    callback_data="sun"),
             ]]),
         )
     except Exception as e:
-        print(f"[ERROR - radar_command] user={user.id} error={e}")
+        print(f"[ERROR - rain_command] user={user.id} error={e}")
         await thinking.edit_text("⚠️ Couldn't build the chart right now. Try again shortly.")
 
 
-async def radar_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Inline 🌧️ Rain Chart button."""
+async def rain_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Inline 🌧️ Rain button."""
     user  = update.effective_user
     query = update.callback_query
     await query.answer("📊 Building rain chart…")
@@ -2789,7 +2894,66 @@ async def radar_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="Markdown",
         )
     except Exception as e:
-        print(f"[ERROR - radar_callback] user={user.id} error={e}")
+        print(f"[ERROR - rain_callback] user={user.id} error={e}")
+        await query.message.reply_text("⚠️ Couldn't build the chart right now.")
+
+
+async def sun_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/sun — temperature chart for today."""
+    user = update.effective_user
+    msg  = update.effective_message
+    await log_activity(user, "sun_command")
+    await upsert_customer(user)
+
+    area = await get_user_last_area(user.id)
+    if not area:
+        await msg.reply_text("⚠️ No location found. Share your location first.")
+        return
+
+    thinking = await msg.reply_text("🌡️ Building temperature chart...")
+    try:
+        buf, err = await generate_temp_chart(user.id, area)
+        if err:
+            await thinking.edit_text(err)
+            return
+        short_area = area.split(",")[0].strip()
+        await thinking.delete()
+        await msg.reply_photo(
+            photo=buf,
+            caption=f"🌡️ *Feels-like temperature — {short_area}*\nToday's curve · now marked in yellow",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("💡 Full Insights", callback_data="insights"),
+                InlineKeyboardButton("🌧️ Rain Chart",    callback_data="rain"),
+            ]]),
+        )
+    except Exception as e:
+        print(f"[ERROR - sun_command] user={user.id} error={e}")
+        await thinking.edit_text("⚠️ Couldn't build the chart right now. Try again shortly.")
+
+
+async def sun_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Inline 🌡️ Temp Chart button."""
+    user  = update.effective_user
+    query = update.callback_query
+    await query.answer("🌡️ Building temperature chart…")
+    area = await get_user_last_area(user.id)
+    if not area:
+        await query.message.reply_text("⚠️ No location found. Share your location first.")
+        return
+    try:
+        buf, err = await generate_temp_chart(user.id, area)
+        if err:
+            await query.message.reply_text(err)
+            return
+        short_area = area.split(",")[0].strip()
+        await query.message.reply_photo(
+            photo=buf,
+            caption=f"🌡️ *Feels-like temperature — {short_area}*\nToday's curve · now marked in yellow",
+            parse_mode="Markdown",
+        )
+    except Exception as e:
+        print(f"[ERROR - sun_callback] user={user.id} error={e}")
         await query.message.reply_text("⚠️ Couldn't build the chart right now.")
 
 
@@ -2969,13 +3133,12 @@ async def send_morning_alerts(context: ContextTypes.DEFAULT_TYPE):
 
 async def send_rain_proximity_alerts(context: ContextTypes.DEFAULT_TYPE):
     """
-    Runs every hour.
-    Checks if any user's area has rain probability > 80% in the next 2 hours.
-    Sends a one-off alert if so, but only if alerts_enabled and not already alerted today.
-    Uses alerts_sent table for deduplication.
+    Runs every hour. Checks rain, heat, and AQI using fresh auto-refreshed data.
+    Time-based cooldowns: rain=6h, heat=4h, aqi=8h.
+    Only fires when conditions changed significantly since last alert.
     """
-    now   = datetime.datetime.now()
-    today = datetime.date.today()
+    now = datetime.datetime.now()
+    COOLDOWNS = {"rain_proximity": 6, "heat_proximity": 4, "aqi_proximity": 8}
 
     async with (await get_pool()).acquire() as conn:
         users = await conn.fetch(
@@ -2983,28 +3146,27 @@ async def send_rain_proximity_alerts(context: ContextTypes.DEFAULT_TYPE):
             SELECT sl.user_id, sl.area
             FROM saved_locations sl
             JOIN users u ON u.user_id = sl.user_id
-            WHERE sl.is_default = TRUE
-              AND u.alerts_enabled = TRUE
+            WHERE sl.is_default = TRUE AND u.alerts_enabled = TRUE
             """
         )
 
     for row in users:
         try:
             async with (await get_pool()).acquire() as conn:
-                # Check if rain alert already sent today for this user
-                already_sent = await conn.fetchval(
+                last_alerts = await conn.fetch(
                     """
-                    SELECT 1 FROM alerts_sent
+                    SELECT alert_type, MAX(sent_at) AS last_sent, MAX(detail) AS last_detail
+                    FROM alerts_sent
                     WHERE user_id = $1
-                      AND alert_type = 'rain_proximity'
-                      AND sent_at::date = $2
+                      AND alert_type IN ('rain_proximity','heat_proximity','aqi_proximity')
+                    GROUP BY alert_type
                     """,
-                    row["user_id"], today,
+                    row["user_id"],
                 )
-                if already_sent:
-                    continue
-
-                # Get the latest run
+                last_by_type = {
+                    r["alert_type"]: {"sent_at": r["last_sent"], "detail": r["last_detail"]}
+                    for r in last_alerts
+                }
                 run_row = await conn.fetchrow(
                     """
                     SELECT id FROM scraper_runs
@@ -3015,110 +3177,237 @@ async def send_rain_proximity_alerts(context: ContextTypes.DEFAULT_TYPE):
                 )
                 if not run_row:
                     continue
-
-                # Look at next 2 hours of rain probability
-                rain_rows = await conn.fetch(
+                run_id = run_row["id"]
+                hourly = await conn.fetch(
                     """
-                    SELECT timestamp, precipitation_probability, rain
+                    SELECT timestamp, precipitation_probability, rain,
+                           apparent_temperature
                     FROM hourly_weather
                     WHERE run_id = $1
-                      AND timestamp BETWEEN $2 AND $2 + INTERVAL '2 hours'
+                      AND timestamp >= $2
+                      AND timestamp <= $2 + INTERVAL '3 hours'
                     ORDER BY timestamp ASC
                     """,
-                    run_row["id"], now,
+                    run_id, now,
+                )
+                current = await conn.fetchrow(
+                    "SELECT scraped_aqi_value, scraped_aqi_category, us_aqi"
+                    " FROM current_weather WHERE run_id = $1 LIMIT 1",
+                    run_id,
                 )
 
-            if not rain_rows:
+            if not hourly and not current:
                 continue
 
-            max_prob = max(r["precipitation_probability"] or 0 for r in rain_rows)
-            if max_prob < 80:
-                continue
+            def _cooldown_passed(atype):
+                rec = last_by_type.get(atype)
+                if not rec or not rec["sent_at"]:
+                    return True
+                age = (now - rec["sent_at"].replace(tzinfo=None)).total_seconds() / 3600
+                return age >= COOLDOWNS[atype]
 
-            # Send alert
-            await context.bot.send_message(
-                chat_id=row["user_id"],
-                text=f"🌧️ Rain alert for {row['area']}: {round(max_prob)}% chance of rain in the next 2 hours. Carry an umbrella!",
-            )
+            def _last_val(atype):
+                rec = last_by_type.get(atype)
+                try:
+                    return float(rec["detail"]) if rec and rec["detail"] else 0.0
+                except Exception:
+                    return 0.0
 
-            # Log to alerts_sent
-            async with (await get_pool()).acquire() as log_conn:
-                await log_conn.execute(
-                    """
-                    INSERT INTO alerts_sent (user_id, alert_type, area)
-                    VALUES ($1, 'rain_proximity', $2)
-                    ON CONFLICT DO NOTHING
-                    """,
-                    row["user_id"], row["area"],
-                )
+            short_area = row["area"].split(",")[0].strip()
 
-            print(f"[RAIN ALERT] Sent to user {row['user_id']} ({row['area']})")
+            # RAIN CHECK
+            if hourly and _cooldown_passed("rain_proximity"):
+                max_prob  = max((r["precipitation_probability"] or 0) for r in hourly)
+                last_prob = _last_val("rain_proximity")
+                if max_prob >= 60 and (max_prob - last_prob) >= 25:
+                    total_mm  = round(sum(r["rain"] or 0 for r in hourly), 1)
+                    peak_row  = max(hourly, key=lambda h: h["precipitation_probability"] or 0)
+                    peak_time = peak_row["timestamp"].strftime("%I:%M %p").lstrip("0")
+                    prob_str  = str(round(max_prob))
+                    mm_part   = (" ~" + str(total_mm) + "mm") if total_mm > 0 else ""
+                    if max_prob >= 80:
+                        msg = ("\U0001f327 *Rain incoming \u2014 " + short_area + "*\n\n"
+                               "High chance of rain around " + peak_time
+                               + " (" + prob_str + "%)" + mm_part
+                               + "\n\n\u2602 Carry an umbrella.")
+                    else:
+                        msg = ("\U0001f326 *Rain possible \u2014 " + short_area + "*\n\n"
+                               + prob_str + "% chance around " + peak_time + ".\n"
+                               "Keep an umbrella handy.")
+                    kb = InlineKeyboardMarkup([[
+                        InlineKeyboardButton("\U0001f327 Rain chart",    callback_data="rain"),
+                        InlineKeyboardButton("\U0001f4a1 Full insights", callback_data="insights"),
+                    ]])
+                    await context.bot.send_message(
+                        chat_id=row["user_id"], text=msg, parse_mode="Markdown", reply_markup=kb)
+                    async with (await get_pool()).acquire() as lc:
+                        await lc.execute(
+                            "INSERT INTO alerts_sent (user_id, alert_type, area, detail)"
+                            " VALUES ($1, 'rain_proximity', $2, $3)",
+                            row["user_id"], row["area"], str(round(max_prob)),
+                        )
+                    print(f"[RAIN ALERT] user={row['user_id']} area={short_area} prob={round(max_prob)}%")
+
+            # HEAT CHECK
+            if hourly and _cooldown_passed("heat_proximity"):
+                max_feels  = max((r["apparent_temperature"] or 0) for r in hourly)
+                last_feels = _last_val("heat_proximity")
+                if max_feels >= 32 and (max_feels - last_feels) >= 3:
+                    feels_s = str(round(max_feels, 1))
+                    if max_feels >= 35:
+                        msg = ("\U0001f525 *Dangerous heat \u2014 " + short_area + "*\n\n"
+                               "Feels like " + feels_s + "\u00b0C right now.\n\n"
+                               "\u26d4 Stay indoors \u00b7 \U0001f4a7 Water every 20 min \u00b7 \U0001f9f4 SPF 50+")
+                    else:
+                        msg = ("\U0001f321 *Getting hot \u2014 " + short_area + "*\n\n"
+                               "Feels like " + feels_s + "\u00b0C.\n"
+                               "\U0001f4a7 Stay hydrated and apply SPF 50+ if heading out.")
+                    kb = InlineKeyboardMarkup([[
+                        InlineKeyboardButton("\U0001f4a1 Today's insights", callback_data="insights"),
+                    ]])
+                    await context.bot.send_message(
+                        chat_id=row["user_id"], text=msg, parse_mode="Markdown", reply_markup=kb)
+                    async with (await get_pool()).acquire() as lc:
+                        await lc.execute(
+                            "INSERT INTO alerts_sent (user_id, alert_type, area, detail)"
+                            " VALUES ($1, 'heat_proximity', $2, $3)",
+                            row["user_id"], row["area"], str(round(max_feels, 1)),
+                        )
+                    print(f"[HEAT ALERT] user={row['user_id']} area={short_area} feels={round(max_feels,1)}C")
+
+            # AQI CHECK
+            if current and _cooldown_passed("aqi_proximity"):
+                aqi_val, aqi_cat = None, ""
+                try:
+                    raw = current["scraped_aqi_value"] or current["us_aqi"]
+                    aqi_val = round(float(raw)) if raw else None
+                    aqi_cat = current["scraped_aqi_category"] or ""
+                except Exception:
+                    pass
+                if aqi_val and aqi_val > 100:
+                    last_aqi = _last_val("aqi_proximity")
+                    if (aqi_val - last_aqi) >= 30:
+                        cat_s = (" (" + aqi_cat + ")") if aqi_cat else ""
+                        if aqi_val > 200:
+                            msg = ("\U0001f6a8 *Very poor air \u2014 " + short_area + "*\n\n"
+                                   "AQI " + str(aqi_val) + cat_s + " \u2014 hazardous outside.\n"
+                                   "Keep windows closed.")
+                        else:
+                            msg = ("\U0001f637 *Air quality worsened \u2014 " + short_area + "*\n\n"
+                                   "AQI reached " + str(aqi_val) + cat_s + ".\n"
+                                   "Sensitive groups limit outdoor time.")
+                        kb = InlineKeyboardMarkup([[
+                            InlineKeyboardButton("\U0001f4a1 Full insights", callback_data="insights"),
+                        ]])
+                        await context.bot.send_message(
+                            chat_id=row["user_id"], text=msg, parse_mode="Markdown", reply_markup=kb)
+                        async with (await get_pool()).acquire() as lc:
+                            await lc.execute(
+                                "INSERT INTO alerts_sent (user_id, alert_type, area, detail)"
+                                " VALUES ($1, 'aqi_proximity', $2, $3)",
+                                row["user_id"], row["area"], str(aqi_val),
+                            )
+                        print(f"[AQI ALERT] user={row['user_id']} area={short_area} aqi={aqi_val}")
 
         except Exception as e:
-            print(f"[ERROR - rain_proximity user={row['user_id']}] {e}")
+            print(f"[ERROR - proximity user={row['user_id']}] {e}")
 
 
 async def send_event_reminders(context: ContextTypes.DEFAULT_TYPE):
     """
-    Runs every day at 7:00 AM (same job slot as morning alerts but fires after).
-    - If event is TOMORROW: sends a day-before weather preview.
-    - If event is TODAY: sends a 'good luck today' message with today's forecast.
-    Marks sent=TRUE after the on-day message so it doesn't repeat.
+    Runs every day at 7:00 AM and also every 5 minutes (for same-day timed reminders).
+    - Evening before (day_before): sends ONLY the custom message + event name, no weather
+    - On the day at scheduled time: sends the custom message + action buttons
+    - Marks sent=TRUE after sending to prevent repeats
     """
     today    = datetime.date.today()
     tomorrow = today + datetime.timedelta(days=1)
+    now      = datetime.datetime.now()
 
     async with (await get_pool()).acquire() as conn:
-        # Day-before reminders — event is tomorrow, not yet sent
-        day_before_events = await conn.fetch(
-            """
-            SELECT id, user_id, event_name, area
-            FROM event_reminders
-            WHERE event_date = $1 AND sent = FALSE
-            """,
-            tomorrow,
-        )
+        # ── Day-before reminders — event is tomorrow, not yet sent ──────────
+        try:
+            day_before_events = await conn.fetch(
+                """
+                SELECT id, user_id, event_name, area, custom_message
+                FROM event_reminders
+                WHERE event_date = $1 AND sent = FALSE
+                """,
+                tomorrow,
+            )
+        except Exception:
+            day_before_events = await conn.fetch(
+                "SELECT id, user_id, event_name, area FROM event_reminders WHERE event_date = $1 AND sent = FALSE",
+                tomorrow,
+            )
 
-        # On-the-day reminders — event is today, not yet sent
-        today_events = await conn.fetch(
-            """
-            SELECT id, user_id, event_name, area
-            FROM event_reminders
-            WHERE event_date = $1 AND sent = FALSE
-            """,
-            today,
-        )
+        # ── Today's reminders ────────────────────────────────────────────────
+        try:
+            today_events = await conn.fetch(
+                """
+                SELECT id, user_id, event_name, area, custom_message, remind_time
+                FROM event_reminders
+                WHERE event_date = $1 AND sent = FALSE
+                """,
+                today,
+            )
+        except Exception:
+            today_events = await conn.fetch(
+                "SELECT id, user_id, event_name, area FROM event_reminders WHERE event_date = $1 AND sent = FALSE",
+                today,
+            )
 
-    # ── Day-before: send tomorrow's forecast ─────────────────────────────
+    # ── Day-before: just the custom message, no weather ──────────────────────
     for event in day_before_events:
         try:
-            forecast = await generate_tomorrow_forecast(event["user_id"])
-            location = f" in *{event['area']}*" if event["area"] else ""
-            text = (
-                f"📅 *Reminder:* *{event['event_name']}* is tomorrow{location}!\n\n"
-                f"Here's what the weather looks like:\n\n{forecast}"
-            )
+            custom = event.get("custom_message") if hasattr(event, "get") else None
+            if custom:
+                text = f"📅 *Reminder for tomorrow*\n\n📌 *{event['event_name']}*\n\n{custom}"
+            else:
+                text = (
+                    f"📅 *Reminder: {event['event_name']}* is tomorrow!\n\n"
+                    f"You set this reminder to make sure you don't forget."
+                )
+
+            kb = InlineKeyboardMarkup([[
+                InlineKeyboardButton("🌤️ Check tomorrow's weather", callback_data="tomorrow"),
+            ]])
             await context.bot.send_message(
-                chat_id=event["user_id"], text=text, parse_mode="Markdown"
+                chat_id=event["user_id"], text=text, parse_mode="Markdown", reply_markup=kb
             )
             print(f"[EVENT DAY-BEFORE] Sent to user {event['user_id']} for {event['event_name']}")
         except Exception as e:
             print(f"[ERROR - event_day_before id={event['id']}] {e}")
 
-    # ── On the day: send today's alert digest as the event morning message ─
+    # ── Today: send at the right time ────────────────────────────────────────
     for event in today_events:
         try:
-            area       = event["area"] or await get_user_last_area(event["user_id"])
-            alert_text = await generate_alert_message(event["user_id"], area) if area else None
-            location   = f" in *{event['area']}*" if event["area"] else ""
-            header     = f"🎉 *{event['event_name']}* is today{location}! Here's today's weather:\n\n"
-            text       = header + (alert_text or "No forecast data available yet.")
+            remind_time_str = event.get("remind_time") if hasattr(event, "get") else None
 
+            # Check if it's time to fire this reminder
+            if remind_time_str:
+                try:
+                    rt = datetime.datetime.strptime(remind_time_str, "%H:%M").time()
+                    # Only fire within the current 5-minute window
+                    if not (rt.hour == now.hour and abs(rt.minute - now.minute) <= 5):
+                        continue
+                except Exception:
+                    pass  # malformed time — fire it anyway (7AM job)
+
+            custom = event.get("custom_message") if hasattr(event, "get") else None
+            if custom:
+                text = f"⏰ *Reminder*\n\n📌 *{event['event_name']}*\n\n{custom}"
+            else:
+                text = f"⏰ *Reminder: {event['event_name']}* is today!"
+
+            kb = InlineKeyboardMarkup([[
+                InlineKeyboardButton("💡 Today's insights",  callback_data="insights"),
+                InlineKeyboardButton("🌤️ Weather card",     callback_data="show_weather"),
+            ]])
             await context.bot.send_message(
-                chat_id=event["user_id"], text=text, parse_mode="Markdown"
+                chat_id=event["user_id"], text=text, parse_mode="Markdown", reply_markup=kb
             )
 
-            # Mark as fully sent now that both messages have gone out
             async with (await get_pool()).acquire() as update_conn:
                 await update_conn.execute(
                     "UPDATE event_reminders SET sent = TRUE WHERE id = $1", event["id"]
@@ -3226,6 +3515,57 @@ async def send_weekly_digest(context: ContextTypes.DEFAULT_TYPE):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# AUTO-REFRESH — keeps saved location data fresh (every 25 minutes)
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def auto_refresh_data(context):
+    """
+    Runs every 25 minutes. For each user with a default saved location,
+    checks if the weather data is older than 25 minutes. If so, runs
+    the scraper silently in the background so alerts always have fresh data.
+    Uses existing scraper + tables — no new API needed.
+    """
+    now = datetime.datetime.now()
+    try:
+        async with (await get_pool()).acquire() as conn:
+            # Get all default saved locations with their last scrape time
+            rows = await conn.fetch(
+                """
+                SELECT sl.user_id, sl.area, sl.lat, sl.lon,
+                       MAX(sr.ran_at) AS last_ran
+                FROM saved_locations sl
+                LEFT JOIN scraper_runs sr ON sr.user_id = sl.user_id AND sr.area = sl.area
+                WHERE sl.is_default = TRUE
+                GROUP BY sl.user_id, sl.area, sl.lat, sl.lon
+                """
+            )
+    except Exception as e:
+        print(f"[AUTO-REFRESH] DB error fetching locations: {e}")
+        return
+
+    for row in rows:
+        try:
+            last_ran = row["last_ran"]
+            # Skip if data is fresh (< 25 minutes old)
+            if last_ran is not None:
+                age_min = (now - last_ran.replace(tzinfo=None)).total_seconds() / 60
+                if age_min < 25:
+                    continue
+
+            # Refresh in background thread — non-blocking
+            print(f"[AUTO-REFRESH] Refreshing {row['area']} for user {row['user_id']}")
+            await asyncio.to_thread(
+                run_scraper,
+                row["lat"], row["lon"],
+                "fallback",         # use Open-Meteo only — no URL search needed
+                row["user_id"],
+                row["area"],
+            )
+        except Exception as e:
+            print(f"[AUTO-REFRESH] Error refreshing user={row['user_id']} area={row['area']}: {e}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # MAIN
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -3260,6 +3600,13 @@ def main():
             EVENT_DATE_WAITING: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, remind_receive_date)
             ],
+            EVENT_TIME_WAITING: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, remind_receive_time)
+            ],
+            EVENT_MSG_WAITING: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, remind_receive_message),
+                CommandHandler("skip", remind_receive_message),
+            ],
         },
         fallbacks=[CommandHandler("cancel", cancel_remind)],
     )
@@ -3276,7 +3623,8 @@ def main():
     app.add_handler(CommandHandler("settings",       settings_command))
     app.add_handler(CommandHandler("appearance",     appearance_command))
     app.add_handler(CommandHandler("ask",            ask_command))
-    app.add_handler(CommandHandler("radar",          radar_command))
+    app.add_handler(CommandHandler("rain",           rain_command))
+    app.add_handler(CommandHandler("sun",            sun_command))
     app.add_handler(CallbackQueryHandler(settings_callback,          pattern="^settings_"))
     app.add_handler(CallbackQueryHandler(appearance_choice_callback, pattern="^appearance_"))
 
@@ -3294,7 +3642,8 @@ def main():
     app.add_handler(CallbackQueryHandler(choice_weather_callback,     pattern="^choice_weather\\|"))
     app.add_handler(CallbackQueryHandler(choice_insights_callback,    pattern="^choice_insights\\|"))
     app.add_handler(CallbackQueryHandler(show_weather_callback,       pattern="^show_weather$"))
-    app.add_handler(CallbackQueryHandler(radar_callback,               pattern="^radar$"))
+    app.add_handler(CallbackQueryHandler(rain_callback,                pattern="^rain$"))
+    app.add_handler(CallbackQueryHandler(sun_callback,                 pattern="^sun$"))
     app.add_handler(CallbackQueryHandler(feedback_callback,           pattern="^feedback_"))
     app.add_handler(CallbackQueryHandler(save_location_prompt,        pattern="^save_location$"))
     app.add_handler(CallbackQueryHandler(manage_location_callback,    pattern="^manage_loc_"))
@@ -3347,6 +3696,22 @@ def main():
         interval=3600,
         first=60,
         name="rain_proximity",
+    )
+
+    # Auto-refresh weather data every 25 minutes for all saved locations
+    app.job_queue.run_repeating(
+        auto_refresh_data,
+        interval=1500,   # 25 minutes
+        first=120,       # first run 2 min after startup
+        name="auto_refresh",
+    )
+
+    # Same-day reminders — check every 5 minutes
+    app.job_queue.run_repeating(
+        send_event_reminders,
+        interval=300,    # 5 minutes
+        first=60,
+        name="event_reminders_realtime",
     )
 
     async def _error_handler(update, context):
