@@ -20,6 +20,12 @@ Design rules (enforced throughout):
 """
 
 from datetime import datetime, timedelta
+
+
+def _now_ist():
+    """IST-aware current time (UTC+5:30). Works on Railway (UTC) and Windows."""
+    from datetime import timezone, timedelta as _td
+    return (datetime.now(timezone.utc) + _td(hours=5, minutes=30)).replace(tzinfo=None)
 from typing import Optional
 
 
@@ -311,7 +317,7 @@ def insight_rain(hours: list) -> Optional[str]:
                 f"({round(peak_row['precipitation_probability'])}%) — carry an umbrella.")
 
     rain_groups.sort(key=lambda g: g[0])
-    now = datetime.now()
+    now = _now_ist()
     first_start = rain_groups[0][0]
     mins_until = int((first_start - now).total_seconds() / 60) if first_start > now else 0
 
@@ -835,7 +841,7 @@ def insight_daylight(hours: list, daily: dict) -> Optional[str]:
         except Exception:
             return None
 
-    now = datetime.now()
+    now = _now_ist()
     if now > sunset:
         return None
 
@@ -1028,7 +1034,7 @@ def get_golden_hour(daily: dict) -> Optional[str]:
         except Exception:
             return None
 
-    now = datetime.now()
+    now = _now_ist()
     if sunset <= now:
         return None
 

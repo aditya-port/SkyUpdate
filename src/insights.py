@@ -39,6 +39,19 @@ load_dotenv()
 DATABASE_URL = os.getenv("DATABASE_URL")
 
 
+def _now_ist():
+    """Returns current datetime in IST (UTC+5:30) as a naive datetime.
+    Uses UTC + offset so it works correctly on Railway (Linux/UTC) and
+    Windows alike, regardless of server timezone setting."""
+    from datetime import timezone, timedelta
+    return (datetime.now(timezone.utc) + timedelta(hours=5, minutes=30)).replace(tzinfo=None)
+
+
+def _today_ist():
+    """Returns today's date in IST."""
+    return _now_ist().date()
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # SHARED HELPER — find latest run_id for a user+area
 # ─────────────────────────────────────────────────────────────────────────────
@@ -61,7 +74,7 @@ async def _get_run_id(conn, user_id: int, area: str):
 # ─────────────────────────────────────────────────────────────────────────────
 
 async def _get_historical_avg(conn, user_id: int, area: str) -> float | None:
-    today = date.today()
+    today = _today_ist()
     rows = await conn.fetch(
         """
         SELECT dw.temperature_2m_max
@@ -92,7 +105,7 @@ async def _get_7day_daily_rows(conn, run_id: int) -> list:
     Fetches the last 7 daily_weather rows for this run's area.
     Used by insight_rain_streak() which needs consecutive rainy days.
     """
-    today = date.today()
+    today = _today_ist()
     rows = await conn.fetch(
         """
         SELECT date, precipitation_sum
@@ -119,8 +132,8 @@ async def generate_insights(user_id: int, area: str) -> str:
         if not run_id:
             return "⚠️ No data available yet. Please share your location first."
 
-        now   = datetime.now()
-        today = date.today()
+        now   = _now_ist()
+        today = _today_ist()
 
         hourly_rows = await conn.fetch(
             """
@@ -204,8 +217,8 @@ async def generate_insights_split(user_id: int, area: str) -> tuple:
         if not run_id:
             return "⚠️ No data available yet. Please share your location first.", ""
 
-        now   = datetime.now()
-        today = date.today()
+        now   = _now_ist()
+        today = _today_ist()
 
         hourly_rows = await conn.fetch(
             """
@@ -283,7 +296,7 @@ async def generate_alert_message(user_id: int, area: str) -> str:
         if not run_id:
             return None
 
-        today = date.today()
+        today = _today_ist()
 
         hourly_rows = await conn.fetch(
             """
@@ -368,7 +381,7 @@ async def generate_tomorrow_forecast(user_id: int) -> str:
             return "⚠️ No data available. Please share your location first."
 
         run_id   = row["id"]
-        tomorrow = date.today() + timedelta(days=1)
+        tomorrow = _today_ist() + timedelta(days=1)
 
         hourly_rows = await conn.fetch(
             """
@@ -484,7 +497,7 @@ async def generate_weekly_forecast(user_id: int) -> tuple:
 
         run_id = row["id"]
         area   = row["area"]
-        today  = date.today()
+        today  = _today_ist()
 
         daily_rows = await conn.fetch(
             """
@@ -553,8 +566,8 @@ async def generate_bonus_insights(user_id: int, area: str) -> str:
         if not run_id:
             return ""
 
-        now   = datetime.now()
-        today = date.today()
+        now   = _now_ist()
+        today = _today_ist()
 
         hourly_rows = await conn.fetch(
             """
@@ -632,8 +645,8 @@ async def generate_ask_response(user_id: int, area: str, question: str) -> str:
         if not run_id:
             return "⚠️ No weather data found for your location. Share your location first."
 
-        now   = datetime.now()
-        today = date.today()
+        now   = _now_ist()
+        today = _today_ist()
 
         hourly_rows = await conn.fetch(
             """
@@ -796,8 +809,8 @@ async def generate_radar_chart(user_id: int, area: str):
         if not run_id:
             return None, "⚠️ No data found. Share your location first."
 
-        now   = datetime.now()
-        today = date.today()
+        now   = _now_ist()
+        today = _today_ist()
 
         # Fetch next 6 hours — spans day boundary if needed (e.g. 10PM → 4AM)
         rows = await conn.fetch(
@@ -957,8 +970,8 @@ async def generate_temp_chart(user_id: int, area: str):
         if not run_id:
             return None, "⚠️ No data found. Share your location first."
 
-        today = date.today()
-        now   = datetime.now()
+        today = _today_ist()
+        now   = _now_ist()
 
         # Fetch next 6 hours from now — spans midnight if needed
         rows = await conn.fetch(
@@ -1198,7 +1211,7 @@ async def get_streak_history(user_id: int, area: str) -> list:
     Today's row is not included — the caller has today's active tiers fresh.
     Returns [] if no history yet (new user / first week).
     """
-    today = date.today()
+    today = _today_ist()
     try:
         conn = await asyncpg.connect(DATABASE_URL, ssl="require")
         try:

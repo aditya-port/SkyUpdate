@@ -17,6 +17,12 @@ Severity scale (higher = more important):
 """
 
 from datetime import datetime
+
+
+def _now_ist():
+    """IST-aware current time (UTC+5:30). Works on Railway (UTC) and Windows."""
+    from datetime import timezone, timedelta
+    return (datetime.now(timezone.utc) + timedelta(hours=5, minutes=30)).replace(tzinfo=None)
 from typing import Optional
 
 
@@ -429,7 +435,7 @@ def _alert_golden_hour(daily: dict):
             sunset = datetime.fromisoformat(sunset)
         except Exception:
             return None
-    now = datetime.now()
+    now = _now_ist()
     if sunset <= now:
         return None
     # Only mention if sunset is within the rest of the day and sky looks clear

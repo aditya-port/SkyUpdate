@@ -10,6 +10,11 @@ def run_scraper(lat: float, lon: float, url: str, user_id: int, area: str):
     load_dotenv()  # loads .env from project root (src/.env)
 
     DB_URL = os.getenv("DATABASE_URL")
+
+    # Use IST for all timestamps so they match Open-Meteo data (stored in IST)
+    from datetime import timezone, timedelta
+    def _now_ist():
+        return (datetime.now(timezone.utc) + timedelta(hours=5, minutes=30)).replace(tzinfo=None)
     TIMEZONE = "Asia/Kolkata"
 
     r = up.urlparse(DB_URL)
@@ -317,7 +322,7 @@ def run_scraper(lat: float, lon: float, url: str, user_id: int, area: str):
         )
         VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
     """, (
-        user_id, area, run_id, datetime.now(),
+        user_id, area, run_id, _now_ist(),
         c.get("temperature_2m"), c.get("relative_humidity_2m"), c.get("apparent_temperature"),
         c.get("precipitation"), c.get("rain"), c.get("snowfall"), c.get("cloud_cover"),
         c.get("pressure_msl"), c.get("surface_pressure"),
@@ -344,7 +349,7 @@ def run_scraper(lat: float, lon: float, url: str, user_id: int, area: str):
         )
         VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
     """, (
-        user_id, area, run_id, datetime.now(),
+        user_id, area, run_id, _now_ist(),
         temp, condition,
         sunrise, sunset, high, low,
         humidity, pressure, visibility, wind_speed,

@@ -44,6 +44,18 @@ from insights_engine import build_streak_context
 
 # ── Environment ───────────────────────────────────────────────────────────────
 load_dotenv()  # loads .env from project root (src/.env)
+
+
+def _now_ist():
+    """Returns current datetime in IST (UTC+5:30) as naive datetime.
+    Works correctly on Railway (UTC) and Windows alike."""
+    import datetime as _dt
+    return (_dt.datetime.now(_dt.timezone.utc) + _dt.timedelta(hours=5, minutes=30)).replace(tzinfo=None)
+
+
+def _today_ist():
+    """Returns today's date in IST."""
+    return _now_ist().date()
 BOT_TOKEN    = os.getenv("BOT_TOKEN")
 DATABASE_URL = os.getenv("DATABASE_URL")
 
@@ -119,7 +131,7 @@ _WAITING_NIGHT = [
 def _waiting_line() -> str:
     """Returns a time-appropriate loading message."""
     import random
-    h = datetime.datetime.now().hour
+    h = _now_ist().hour
     if 5 <= h < 12:
         return random.choice(_WAITING_MORNING)
     elif 12 <= h < 17:
@@ -472,7 +484,7 @@ async def read_weather_db(user_id: int) -> str:
         if not scraped:
             return "⚠️ No weather data found. Please try sharing your location again."
 
-        today  = date.today()
+        today  = _today_ist()
         run_id = scraped["run_id"]
 
         # Current actual temperature + current UV from current_weather
@@ -566,7 +578,7 @@ async def read_weather_db(user_id: int) -> str:
     daily_uv_max = daily["uv_index_max"] if daily else None
 
     def _sun_has_set() -> bool:
-        now = datetime.now()
+        now = _now_ist()
         raw = (daily.get("sunset") if daily else None) or scraped.get("sunset")
         if raw is None:
             return False
@@ -622,7 +634,7 @@ async def read_weather_db(user_id: int) -> str:
     scraped_at = scraped.get("scraped_at")
     if scraped_at:
         from datetime import timezone
-        now_naive = datetime.now()
+        now_naive = _now_ist()
         if hasattr(scraped_at, 'tzinfo') and scraped_at.tzinfo is not None:
             scraped_at = scraped_at.replace(tzinfo=None)
         age_mins = int((now_naive - scraped_at).total_seconds() / 60)
@@ -917,7 +929,7 @@ async def build_weather_message(user_id: int, area_string: str, nickname: str = 
             weather_text   = f"{location_label}\n" + await read_weather_db(user_id)
             return weather_text, keyboard, "text"
 
-        today  = date.today()
+        today  = _today_ist()
         rid    = scraped["run_id"]
 
         current = await conn.fetchrow(
@@ -1069,7 +1081,7 @@ async def build_weather_message(user_id: int, area_string: str, nickname: str = 
         try:
             if hasattr(scraped_at, "tzinfo") and scraped_at.tzinfo:
                 scraped_at = scraped_at.replace(tzinfo=None)
-            age = int((datetime.now() - scraped_at).total_seconds() / 60)
+            age = int((_now_ist() - scraped_at).total_seconds() / 60)
             updated_str = "Updated just now" if age < 1 else (
                 f"Updated {age} min ago" if age < 60 else f"Updated {age//60}h ago"
             )
@@ -1092,7 +1104,7 @@ async def build_weather_message(user_id: int, area_string: str, nickname: str = 
     stale_warning = ""
     if scraped_at:
         try:
-            age_mins = int((datetime.datetime.now() - (scraped_at.replace(tzinfo=None) if hasattr(scraped_at, "tzinfo") and scraped_at.tzinfo else scraped_at)).total_seconds() / 60)
+            age_mins = int((_now_ist() - (scraped_at.replace(tzinfo=None) if hasattr(scraped_at, "tzinfo") and scraped_at.tzinfo else scraped_at)).total_seconds() / 60)
             if age_mins > 180:
                 stale_warning = f"⚠️ Data from {age_mins//60}h ago"
         except Exception:
@@ -1360,7 +1372,7 @@ async def _check_rate_limit(user_id: int) -> int:
             )
         if not row:
             return 999
-        age = (datetime.datetime.now() - row["ran_at"].replace(tzinfo=None)).total_seconds()
+        age = (_now_ist() - row["ran_at"].replace(tzinfo=None)).total_seconds()
         return int(age)
     except Exception:
         return 999
@@ -2423,7 +2435,7 @@ async def remind_receive_date(update: Update, context: ContextTypes.DEFAULT_TYPE
     user       = update.effective_user
     text       = update.message.text.strip().lower()
     event_name = context.user_data.get("remind_event_name", "Event")
-    today      = datetime.date.today()
+    today      = _today_ist()
 
     if text == "today":
         event_date = today
@@ -2469,7 +2481,7 @@ async def remind_receive_time(update: Update, context: ContextTypes.DEFAULT_TYPE
     """Receives time for same-day reminder, then asks for custom message."""
     import re as _re
     text = update.message.text.strip().lower()
-    now  = datetime.datetime.now()
+    now  = _now_ist()
 
     if text == "now":
         remind_time = now.time().replace(second=0, microsecond=0)
@@ -2508,7 +2520,7 @@ async def remind_receive_message(update: Update, context: ContextTypes.DEFAULT_T
     user       = update.effective_user
     text       = update.message.text.strip()
     event_name = context.user_data.get("remind_event_name", "Event")
-    event_date = datetime.date.fromisoformat(context.user_data.get("remind_event_date", datetime.date.today().isoformat()))
+    event_date = datetime.date.fromisoformat(context.user_data.get("remind_event_date", _today_ist().isoformat()))
     remind_time_str = context.user_data.get("remind_event_time")
 
     # /skip command is handled by ConversationHandler fallback — but if user types it as text
@@ -2545,7 +2557,7 @@ async def remind_receive_message(update: Update, context: ContextTypes.DEFAULT_T
                 user.id, event_name, event_date, area, lat, lon,
             )
 
-    today = datetime.date.today()
+    today = _today_ist()
     if event_date == today and remind_time_str:
         confirm = (
             f"✅ Reminder set! I'll message you at *{remind_time_str}* today\n"
@@ -2584,7 +2596,7 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
         # Rainy days in the user's primary area this month
-        today = datetime.date.today()
+        today = _today_ist()
         rain_count = await conn.fetchval(
             """
             SELECT COUNT(DISTINCT dw.date)
@@ -2968,9 +2980,9 @@ async def send_night_prewarning(context: ContextTypes.DEFAULT_TYPE):
     sends a short heads-up message to users with alerts enabled.
     Deduplicates using alerts_sent table with type 'night_prewarning'.
     """
-    today    = datetime.date.today()
+    today    = _today_ist()
     tomorrow = today + datetime.timedelta(days=1)
-    now      = datetime.datetime.now()
+    now      = _now_ist()
 
     # Only fire between 8 PM and 9 PM
     if not (20 <= now.hour < 21):
@@ -3060,8 +3072,8 @@ async def send_morning_alerts(context: ContextTypes.DEFAULT_TYPE):
     Defaults to 07:00 if alert_time is NULL.
     Logs to morning_alerts_log to prevent re-sending on bot restart.
     """
-    now   = datetime.datetime.now()
-    today = datetime.date.today()
+    now   = _now_ist()
+    today = _today_ist()
 
     async with (await get_pool()).acquire() as conn:
         users = await conn.fetch(
@@ -3137,7 +3149,7 @@ async def send_rain_proximity_alerts(context: ContextTypes.DEFAULT_TYPE):
     Time-based cooldowns: rain=6h, heat=4h, aqi=8h.
     Only fires when conditions changed significantly since last alert.
     """
-    now = datetime.datetime.now()
+    now = _now_ist()
     COOLDOWNS = {"rain_proximity": 6, "heat_proximity": 4, "aqi_proximity": 8}
 
     async with (await get_pool()).acquire() as conn:
@@ -3222,6 +3234,12 @@ async def send_rain_proximity_alerts(context: ContextTypes.DEFAULT_TYPE):
                 if max_prob >= 60 and (max_prob - last_prob) >= 25:
                     total_mm  = round(sum(r["rain"] or 0 for r in hourly), 1)
                     peak_row  = max(hourly, key=lambda h: h["precipitation_probability"] or 0)
+                    # Skip if the peak hour is already in the past (stale alert guard)
+                    peak_ts   = peak_row["timestamp"]
+                    if hasattr(peak_ts, "replace"):
+                        peak_naive = peak_ts.replace(tzinfo=None) if hasattr(peak_ts, "tzinfo") and peak_ts.tzinfo else peak_ts
+                        if peak_naive < now:
+                            continue
                     peak_time = peak_row["timestamp"].strftime("%I:%M %p").lstrip("0")
                     prob_str  = str(round(max_prob))
                     mm_part   = (" ~" + str(total_mm) + "mm") if total_mm > 0 else ""
@@ -3253,6 +3271,12 @@ async def send_rain_proximity_alerts(context: ContextTypes.DEFAULT_TYPE):
                 max_feels  = max((r["apparent_temperature"] or 0) for r in hourly)
                 last_feels = _last_val("heat_proximity")
                 if max_feels >= 32 and (max_feels - last_feels) >= 3:
+                    # Staleness guard — find the peak hour and skip if it already passed
+                    peak_h_row = max(hourly, key=lambda h: h["apparent_temperature"] or 0)
+                    peak_h_ts  = peak_h_row["timestamp"]
+                    peak_h_ts  = peak_h_ts.replace(tzinfo=None) if getattr(peak_h_ts, "tzinfo", None) else peak_h_ts
+                    if peak_h_ts < now:
+                        continue
                     feels_s = str(round(max_feels, 1))
                     if max_feels >= 35:
                         msg = ("\U0001f525 *Dangerous heat \u2014 " + short_area + "*\n\n"
@@ -3320,9 +3344,9 @@ async def send_event_reminders(context: ContextTypes.DEFAULT_TYPE):
     - On the day at scheduled time: sends the custom message + action buttons
     - Marks sent=TRUE after sending to prevent repeats
     """
-    today    = datetime.date.today()
+    today    = _today_ist()
     tomorrow = today + datetime.timedelta(days=1)
-    now      = datetime.datetime.now()
+    now      = _now_ist()
 
     async with (await get_pool()).acquire() as conn:
         # ── Day-before reminders — event is tomorrow, not yet sent ──────────
@@ -3425,7 +3449,7 @@ async def send_weekly_digest(context: ContextTypes.DEFAULT_TYPE):
     Sends a 7-day summary to users with a default saved location.
     Skips users who already received a digest this week.
     """
-    today      = datetime.date.today()
+    today      = _today_ist()
     week_start = today - datetime.timedelta(days=today.weekday())
 
     async with (await get_pool()).acquire() as conn:
@@ -3525,7 +3549,7 @@ async def auto_refresh_data(context):
     the scraper silently in the background so alerts always have fresh data.
     Uses existing scraper + tables — no new API needed.
     """
-    now = datetime.datetime.now()
+    now = _now_ist()
     try:
         async with (await get_pool()).acquire() as conn:
             # Get all default saved locations with their last scrape time
