@@ -799,15 +799,18 @@ async def generate_radar_chart(user_id: int, area: str):
         now   = datetime.now()
         today = date.today()
 
+        # Fetch next 6 hours — spans day boundary if needed (e.g. 10PM → 4AM)
         rows = await conn.fetch(
             """
             SELECT timestamp, precipitation_probability, rain
             FROM hourly_weather
-            WHERE run_id = $1 AND timestamp >= $2 AND DATE(timestamp) = $3
+            WHERE run_id = $1
+              AND timestamp >= $2
+              AND timestamp < $2 + INTERVAL '6 hours'
             ORDER BY timestamp ASC
-            LIMIT 8
+            LIMIT 6
             """,
-            run_id, now, today
+            run_id, now
         )
     finally:
         await conn.close()
@@ -869,7 +872,8 @@ async def generate_radar_chart(user_id: int, area: str):
     f_small = _try_font("Poppins-Light.ttf",   13)
 
     # Title
-    title = f"Rain forecast — next {n} hours"
+    now_lbl = now.strftime("%I:%M %p").lstrip("0")
+    title = f"Rain — next 6h from {now_lbl}"
     draw.text((PAD_L, 14), title, font=f_title, fill=TITLE_C)
 
     # Y-axis grid lines at 0, 25, 50, 75, 100
@@ -956,15 +960,19 @@ async def generate_temp_chart(user_id: int, area: str):
         today = date.today()
         now   = datetime.now()
 
+        # Fetch next 6 hours from now — spans midnight if needed
         rows = await conn.fetch(
             """
             SELECT timestamp, apparent_temperature, temperature_2m,
                    uv_index, is_day, precipitation_probability
             FROM hourly_weather
-            WHERE run_id = $1 AND DATE(timestamp) = $2
+            WHERE run_id = $1
+              AND timestamp >= $2
+              AND timestamp < $2 + INTERVAL '6 hours'
             ORDER BY timestamp ASC
+            LIMIT 6
             """,
-            run_id, today
+            run_id, now
         )
         daily = await conn.fetchrow(
             """
@@ -1055,7 +1063,8 @@ async def generate_temp_chart(user_id: int, area: str):
     tmax_val = daily.get("apparent_temperature_max")
     tmin_val = daily.get("apparent_temperature_min")
     range_str = f"  ·  {round(tmin_val)}°–{round(tmax_val)}°C" if tmax_val and tmin_val else ""
-    draw.text((PAD_L, 14), f"Temperature today — {short}{range_str}", font=f_title, fill=TITLE_C)
+    now_label = now.strftime("%I:%M %p").lstrip("0")
+    draw.text((PAD_L, 14), f"Temp next 6h — {short} · from {now_label}", font=f_title, fill=TITLE_C)
 
     # Y-axis grid lines
     step = 5
@@ -1075,7 +1084,10 @@ async def generate_temp_chart(user_id: int, area: str):
             label = ts.strftime("%-I%p").lower() if hasattr(ts, 'strftime') else str(i)
             draw.text((xx, PAD_T + ch + 10), label, font=f_small, fill=MUTED, anchor="mm")
 
-    # Sunrise/sunset vertical lines
+    # Since X-axis spans exactly the fetched hours (index 0 = now, n-1 = now+5h),
+    # all markers must use index-based positions, not wall-clock fractions.
+    # This is the fix for the "now shows 3PM when it's 9:30PM" bug.
+
     def _parse_iso(v):
         if v is None: return None
         if isinstance(v, str):
@@ -1085,19 +1097,40 @@ async def generate_temp_chart(user_id: int, area: str):
             except: return None
         return v
 
+    # Get the actual timestamp range from fetched data
+    ts_list = [h.get("timestamp") for h in hours if h.get("timestamp") is not None]
+    t_start = ts_list[0]  if ts_list else now
+    t_end   = ts_list[-1] if ts_list else now
+
+    def _dt_to_x(dt):
+        """Convert a datetime to x pixel position based on the fetched time window."""
+        if dt is None:
+            return None
+        total_secs = (t_end - t_start).total_seconds()
+        if total_secs <= 0:
+            return PAD_L
+        offset = (dt - t_start).total_seconds()
+        frac   = max(0.0, min(1.0, offset / total_secs))
+        return PAD_L + int(frac * cw)
+
+    # Sunrise/sunset — only draw if within our 6-hour window
     sr = _parse_iso(daily.get("sunrise"))
     ss = _parse_iso(daily.get("sunset"))
 
     for dt_mark, col, label in [(sr, SR_C, "🌅"), (ss, SS_C, "🌇")]:
-        if dt_mark and dt_mark.date() == today:
-            frac = (dt_mark.hour * 60 + dt_mark.minute) / (24 * 60)
-            xm   = PAD_L + int(frac * cw)
-            draw.line([(xm, PAD_T), (xm, PAD_T + ch)], fill=col, width=1)
-            draw.text((xm, PAD_T - 4), label, font=f_small, fill=col, anchor="mm")
+        if dt_mark is not None:
+            # Normalise to naive datetime for comparison
+            dm = dt_mark.replace(tzinfo=None) if hasattr(dt_mark, "tzinfo") and dt_mark.tzinfo else dt_mark
+            ts_start_n = t_start.replace(tzinfo=None) if hasattr(t_start, "tzinfo") and t_start.tzinfo else t_start
+            ts_end_n   = t_end.replace(tzinfo=None)   if hasattr(t_end,   "tzinfo") and t_end.tzinfo   else t_end
+            if ts_start_n <= dm <= ts_end_n:
+                xm = _dt_to_x(dm)
+                if xm is not None:
+                    draw.line([(xm, PAD_T), (xm, PAD_T + ch)], fill=col, width=1)
+                    draw.text((xm, PAD_T - 4), label, font=f_small, fill=col, anchor="mm")
 
-    # Current time vertical line
-    now_frac = (now.hour * 60 + now.minute) / (24 * 60)
-    now_x    = PAD_L + int(now_frac * cw)
+    # "Now" marker — always at x_pos(0) since index 0 IS the current hour
+    now_x = PAD_L  # index 0 = leftmost bar = now
     draw.line([(now_x, PAD_T), (now_x, PAD_T + ch)], fill=NOW_C, width=2)
     draw.text((now_x, PAD_T + ch + 32), "now", font=f_small, fill=NOW_C, anchor="mm")
 
@@ -1129,14 +1162,11 @@ async def generate_temp_chart(user_id: int, area: str):
         x2, y2 = x_pos(i+1), y_pos(t2)
         draw.line([(x1, y1), (x2, y2)], fill=col, width=3)
 
-    # Dot at current hour
-    now_hour = now.hour
-    cur_rows = [h for h in hours if hasattr(h.get("timestamp"), "hour") and h["timestamp"].hour == now_hour]
-    if cur_rows:
-        ct = cur_rows[0].get("apparent_temperature")
+    # Dot at current hour — always index 0 (leftmost) since we fetch from now
+    if hours:
+        ct = hours[0].get("apparent_temperature")
         if ct is not None:
-            ci = hours.index(cur_rows[0])
-            cx, cy = x_pos(ci), y_pos(ct)
+            cx, cy = x_pos(0), y_pos(ct)
             col = temp_color(ct)
             draw.ellipse([cx-6, cy-6, cx+6, cy+6], fill=col, outline=WHITE, width=2)
             draw.text((cx, cy - 16), f"{round(ct)}°C", font=f_label, fill=col, anchor="mm")
