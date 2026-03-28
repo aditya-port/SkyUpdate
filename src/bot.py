@@ -1722,8 +1722,49 @@ async def log_any_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ── 3. 🏠 Main Menu button ─────────────────────────────────────────────
     if text == "🏠 Main Menu":
+        context.user_data.pop("awaiting_ask", None)  # clear ask mode on menu tap
         await _send_main_menu(update.message, user.id)
         return
+
+    # ── 3b. Conversational /ask mode ──────────────────────────────────────
+    # Triggered when user sent /ask with no question. Allows 2 freeform questions.
+    # Clears automatically after 2 answers or if any other state activates.
+    ask_remaining = context.user_data.get("awaiting_ask", 0)
+    if ask_remaining > 0:
+        # Don't intercept commands or known button texts
+        skip_texts = {"👍 Helpful", "👎 Not helpful", "⏭️ Skip feedback",
+                      "📩 Send Contact", "❌ Cancel"}
+        if text not in skip_texts and not text.startswith("/"):
+            area = await get_user_last_area(user.id)
+            if not area:
+                await update.message.reply_text(
+                    "⚠️ No location found. Share your location first."
+                )
+                context.user_data.pop("awaiting_ask", None)
+                return
+            thinking = await update.message.reply_text("💭 Thinking...")
+            try:
+                answer = await generate_ask_response(user.id, area, text)
+                await thinking.edit_text(answer)
+                # Decrement counter
+                new_count = ask_remaining - 1
+                if new_count > 0:
+                    context.user_data["awaiting_ask"] = new_count
+                    await update.message.reply_text(
+                        f"_You have {new_count} question{'s' if new_count > 1 else ''} left. Ask away or tap 🏠 Main Menu to exit._",
+                        parse_mode="Markdown",
+                    )
+                else:
+                    context.user_data.pop("awaiting_ask", None)
+                    await update.message.reply_text(
+                        "That's your 2 questions used up! Tap /ask to ask more.",
+                        reply_markup=build_main_keyboard(),
+                    )
+            except Exception as e:
+                print(f"[ERROR - ask_mode] user={user.id} {e}")
+                await thinking.edit_text("⚠️ Couldn't answer that right now. Try again shortly.")
+                context.user_data.pop("awaiting_ask", None)
+            return
 
     # ── 4. Generic activity log ────────────────────────────────────────────
     url = text if text.startswith("http://") or text.startswith("https://") else None
@@ -2831,8 +2872,13 @@ async def ask_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     question = " ".join(context.args).strip() if context.args else ""
     if not question:
+        # Enter conversational ask mode — allows 2 questions without /ask prefix
+        context.user_data["awaiting_ask"] = 2
         await msg.reply_text(
-            "💬 Just write your question after /ask\n\nExample: /ask will it rain before 6pm?",
+            "💬 *Ask me anything about your weather*\n\n"
+            "Just type your question — no need for /ask\n\n"
+            "Example: _Will it rain before 6pm?_\n\n"
+            "_You can ask 2 questions in a row._",
             parse_mode="Markdown",
         )
         return
@@ -3145,12 +3191,48 @@ async def send_morning_alerts(context: ContextTypes.DEFAULT_TYPE):
 
 async def send_rain_proximity_alerts(context: ContextTypes.DEFAULT_TYPE):
     """
-    Runs every hour. Checks rain, heat, and AQI using fresh auto-refreshed data.
-    Time-based cooldowns: rain=6h, heat=4h, aqi=8h.
-    Only fires when conditions changed significantly since last alert.
+    Runs every hour.
+
+    RAIN:  fires at 9AM, 1PM, 5PM windows (±15 min). Checks full day forecast
+           for any hour with ≥40% rain probability. Cooldown: once per window slot.
+
+    AQI:   fires at 9:30AM, 1:30PM, 6PM windows (±15 min). Caps display at 500.
+           Cooldown: once per window slot (keyed by date+slot).
+
+    HEAT:  fires any hour when feels-like crosses threshold. Cooldown: 4h.
+           (Heat is time-critical — can't wait for a scheduled window.)
     """
-    now = _now_ist()
-    COOLDOWNS = {"rain_proximity": 6, "heat_proximity": 4, "aqi_proximity": 8}
+    now  = _now_ist()
+    hour = now.hour
+    minute = now.minute
+    today_str = now.strftime("%Y-%m-%d")
+
+    # ── Window helpers ────────────────────────────────────────────────────
+    def _in_window(target_h, target_m=0, tolerance=15):
+        """True if current time is within ±tolerance minutes of target."""
+        now_mins    = hour * 60 + minute
+        target_mins = target_h * 60 + target_m
+        return abs(now_mins - target_mins) <= tolerance
+
+    rain_window = _in_window(9) or _in_window(13) or _in_window(17)
+    aqi_window  = _in_window(9, 30) or _in_window(13, 30) or _in_window(18)
+    heat_always = True  # heat checks every run
+
+    if not rain_window and not aqi_window and not heat_always:
+        return
+
+    # Window slot keys for deduplication (prevents double-fire within same window)
+    def _rain_slot():
+        if _in_window(9):  return today_str + "_rain_9"
+        if _in_window(13): return today_str + "_rain_13"
+        if _in_window(17): return today_str + "_rain_17"
+        return None
+
+    def _aqi_slot():
+        if _in_window(9, 30):  return today_str + "_aqi_930"
+        if _in_window(13, 30): return today_str + "_aqi_1330"
+        if _in_window(18):     return today_str + "_aqi_18"
+        return None
 
     async with (await get_pool()).acquire() as conn:
         users = await conn.fetch(
@@ -3165,7 +3247,8 @@ async def send_rain_proximity_alerts(context: ContextTypes.DEFAULT_TYPE):
     for row in users:
         try:
             async with (await get_pool()).acquire() as conn:
-                last_alerts = await conn.fetch(
+                # Fetch last alert slots to avoid double-firing in same window
+                last_slots = await conn.fetch(
                     """
                     SELECT alert_type, MAX(sent_at) AS last_sent, MAX(detail) AS last_detail
                     FROM alerts_sent
@@ -3177,8 +3260,21 @@ async def send_rain_proximity_alerts(context: ContextTypes.DEFAULT_TYPE):
                 )
                 last_by_type = {
                     r["alert_type"]: {"sent_at": r["last_sent"], "detail": r["last_detail"]}
-                    for r in last_alerts
+                    for r in last_slots
                 }
+
+                # Also fetch today's slot-based dedup keys from detail column
+                slot_rows = await conn.fetch(
+                    """
+                    SELECT detail FROM alerts_sent
+                    WHERE user_id = $1
+                      AND alert_type IN ('rain_slot','aqi_slot')
+                      AND sent_at::date = $2
+                    """,
+                    row["user_id"], now.date(),
+                )
+                fired_slots = {r["detail"] for r in slot_rows}
+
                 run_row = await conn.fetchrow(
                     """
                     SELECT id FROM scraper_runs
@@ -3190,10 +3286,24 @@ async def send_rain_proximity_alerts(context: ContextTypes.DEFAULT_TYPE):
                 if not run_row:
                     continue
                 run_id = run_row["id"]
-                hourly = await conn.fetch(
+
+                # Full day remaining hourly forecast for rain check
+                day_hourly = await conn.fetch(
                     """
-                    SELECT timestamp, precipitation_probability, rain,
-                           apparent_temperature
+                    SELECT timestamp, precipitation_probability, rain, apparent_temperature
+                    FROM hourly_weather
+                    WHERE run_id = $1
+                      AND timestamp >= $2
+                      AND DATE(timestamp) = $3
+                    ORDER BY timestamp ASC
+                    """,
+                    run_id, now, now.date(),
+                ) if rain_window or heat_always else []
+
+                # Next 3h for heat
+                near_hourly = await conn.fetch(
+                    """
+                    SELECT timestamp, apparent_temperature
                     FROM hourly_weather
                     WHERE run_id = $1
                       AND timestamp >= $2
@@ -3201,125 +3311,104 @@ async def send_rain_proximity_alerts(context: ContextTypes.DEFAULT_TYPE):
                     ORDER BY timestamp ASC
                     """,
                     run_id, now,
-                )
+                ) if heat_always else []
+
                 current = await conn.fetchrow(
                     "SELECT scraped_aqi_value, scraped_aqi_category, us_aqi"
                     " FROM current_weather WHERE run_id = $1 LIMIT 1",
                     run_id,
-                )
-
-            if not hourly and not current:
-                continue
-
-            def _cooldown_passed(atype):
-                rec = last_by_type.get(atype)
-                if not rec or not rec["sent_at"]:
-                    return True
-                age = (now - rec["sent_at"].replace(tzinfo=None)).total_seconds() / 3600
-                return age >= COOLDOWNS[atype]
-
-            def _last_val(atype):
-                rec = last_by_type.get(atype)
-                try:
-                    return float(rec["detail"]) if rec and rec["detail"] else 0.0
-                except Exception:
-                    return 0.0
+                ) if aqi_window else None
 
             short_area = row["area"].split(",")[0].strip()
 
-            # RAIN CHECK
-            if hourly and _cooldown_passed("rain_proximity"):
-                max_prob  = max((r["precipitation_probability"] or 0) for r in hourly)
-                last_prob = _last_val("rain_proximity")
-                if max_prob >= 60 and (max_prob - last_prob) >= 25:
-                    total_mm  = round(sum(r["rain"] or 0 for r in hourly), 1)
-                    peak_row  = max(hourly, key=lambda h: h["precipitation_probability"] or 0)
-                    # Skip if the peak hour is already in the past (stale alert guard)
-                    peak_ts   = peak_row["timestamp"]
-                    if hasattr(peak_ts, "replace"):
-                        peak_naive = peak_ts.replace(tzinfo=None) if hasattr(peak_ts, "tzinfo") and peak_ts.tzinfo else peak_ts
-                        if peak_naive < now:
-                            continue
-                    peak_time = peak_row["timestamp"].strftime("%I:%M %p").lstrip("0")
-                    prob_str  = str(round(max_prob))
-                    mm_part   = (" ~" + str(total_mm) + "mm") if total_mm > 0 else ""
-                    if max_prob >= 80:
-                        msg = ("\U0001f327 *Rain incoming \u2014 " + short_area + "*\n\n"
-                               "High chance of rain around " + peak_time
-                               + " (" + prob_str + "%)" + mm_part
-                               + "\n\n\u2602 Carry an umbrella.")
-                    else:
-                        msg = ("\U0001f326 *Rain possible \u2014 " + short_area + "*\n\n"
-                               + prob_str + "% chance around " + peak_time + ".\n"
-                               "Keep an umbrella handy.")
-                    kb = InlineKeyboardMarkup([[
-                        InlineKeyboardButton("\U0001f327 Rain chart",    callback_data="rain"),
-                        InlineKeyboardButton("\U0001f4a1 Full insights", callback_data="insights"),
-                    ]])
-                    await context.bot.send_message(
-                        chat_id=row["user_id"], text=msg, parse_mode="Markdown", reply_markup=kb)
-                    async with (await get_pool()).acquire() as lc:
-                        await lc.execute(
-                            "INSERT INTO alerts_sent (user_id, alert_type, area, detail)"
-                            " VALUES ($1, 'rain_proximity', $2, $3)",
-                            row["user_id"], row["area"], str(round(max_prob)),
-                        )
-                    print(f"[RAIN ALERT] user={row['user_id']} area={short_area} prob={round(max_prob)}%")
+            # ── RAIN CHECK — 9AM, 1PM, 5PM windows ───────────────────────
+            if rain_window and day_hourly:
+                slot = _rain_slot()
+                if slot and slot not in fired_slots:
+                    # Find all hours with meaningful rain probability today
+                    rain_hours = [h for h in day_hourly if (h["precipitation_probability"] or 0) >= 40]
+                    if rain_hours:
+                        max_prob  = max(h["precipitation_probability"] for h in rain_hours)
+                        total_mm  = round(sum(h["rain"] or 0 for h in day_hourly), 1)
+                        peak_row  = max(rain_hours, key=lambda h: h["precipitation_probability"] or 0)
+                        peak_time = peak_row["timestamp"].strftime("%I:%M %p").lstrip("0")
 
-            # HEAT CHECK
-            if hourly and _cooldown_passed("heat_proximity"):
-                max_feels  = max((r["apparent_temperature"] or 0) for r in hourly)
-                last_feels = _last_val("heat_proximity")
-                if max_feels >= 32 and (max_feels - last_feels) >= 3:
-                    # Staleness guard — find the peak hour and skip if it already passed
-                    peak_h_row = max(hourly, key=lambda h: h["apparent_temperature"] or 0)
-                    peak_h_ts  = peak_h_row["timestamp"]
-                    peak_h_ts  = peak_h_ts.replace(tzinfo=None) if getattr(peak_h_ts, "tzinfo", None) else peak_h_ts
-                    if peak_h_ts < now:
-                        continue
-                    feels_s = str(round(max_feels, 1))
-                    if max_feels >= 35:
-                        msg = ("\U0001f525 *Dangerous heat \u2014 " + short_area + "*\n\n"
-                               "Feels like " + feels_s + "\u00b0C right now.\n\n"
-                               "\u26d4 Stay indoors \u00b7 \U0001f4a7 Water every 20 min \u00b7 \U0001f9f4 SPF 50+")
-                    else:
-                        msg = ("\U0001f321 *Getting hot \u2014 " + short_area + "*\n\n"
-                               "Feels like " + feels_s + "\u00b0C.\n"
-                               "\U0001f4a7 Stay hydrated and apply SPF 50+ if heading out.")
-                    kb = InlineKeyboardMarkup([[
-                        InlineKeyboardButton("\U0001f4a1 Today's insights", callback_data="insights"),
-                    ]])
-                    await context.bot.send_message(
-                        chat_id=row["user_id"], text=msg, parse_mode="Markdown", reply_markup=kb)
-                    async with (await get_pool()).acquire() as lc:
-                        await lc.execute(
-                            "INSERT INTO alerts_sent (user_id, alert_type, area, detail)"
-                            " VALUES ($1, 'heat_proximity', $2, $3)",
-                            row["user_id"], row["area"], str(round(max_feels, 1)),
-                        )
-                    print(f"[HEAT ALERT] user={row['user_id']} area={short_area} feels={round(max_feels,1)}C")
+                        # Build smart summary of rain windows
+                        # Group consecutive rainy hours
+                        rain_times = []
+                        for h in rain_hours:
+                            ts = h["timestamp"].strftime("%I%p").lstrip("0").lower()
+                            rain_times.append(ts)
 
-            # AQI CHECK
-            if current and _cooldown_passed("aqi_proximity"):
-                aqi_val, aqi_cat = None, ""
-                try:
-                    raw = current["scraped_aqi_value"] or current["us_aqi"]
-                    aqi_val = round(float(raw)) if raw else None
-                    aqi_cat = current["scraped_aqi_category"] or ""
-                except Exception:
-                    pass
-                if aqi_val and aqi_val > 100:
-                    last_aqi = _last_val("aqi_proximity")
-                    if (aqi_val - last_aqi) >= 30:
-                        cat_s = (" (" + aqi_cat + ")") if aqi_cat else ""
-                        if aqi_val > 200:
-                            msg = ("\U0001f6a8 *Very poor air \u2014 " + short_area + "*\n\n"
-                                   "AQI " + str(aqi_val) + cat_s + " \u2014 hazardous outside.\n"
-                                   "Keep windows closed.")
+                        if len(rain_times) == 1:
+                            when_str = "around " + rain_times[0]
+                        elif len(rain_times) <= 3:
+                            when_str = rain_times[0] + "–" + rain_times[-1]
                         else:
-                            msg = ("\U0001f637 *Air quality worsened \u2014 " + short_area + "*\n\n"
-                                   "AQI reached " + str(aqi_val) + cat_s + ".\n"
-                                   "Sensitive groups limit outdoor time.")
+                            when_str = "multiple windows today"
+
+                        mm_part = (" · ~" + str(total_mm) + "mm total") if total_mm >= 0.5 else ""
+
+                        if max_prob >= 80:
+                            msg = ("\U0001f327 *Heavy rain likely \u2014 " + short_area + "*\n\n"
+                                   + str(round(max_prob)) + "% chance " + when_str + mm_part + "\n\n"
+                                   "\u2602\ufe0f Carry an umbrella. Avoid outdoor plans.")
+                        elif max_prob >= 60:
+                            msg = ("\U0001f327 *Rain likely \u2014 " + short_area + "*\n\n"
+                                   + str(round(max_prob)) + "% chance " + when_str + mm_part + "\n"
+                                   "Keep an umbrella handy.")
+                        else:
+                            msg = ("\U0001f326\ufe0f *Rain possible \u2014 " + short_area + "*\n\n"
+                                   + str(round(max_prob)) + "% chance " + when_str + "\n"
+                                   "Light rain may occur — check before heading out.")
+
+                        kb = InlineKeyboardMarkup([[
+                            InlineKeyboardButton("\U0001f327 Rain chart",    callback_data="rain"),
+                            InlineKeyboardButton("\U0001f4a1 Full insights", callback_data="insights"),
+                        ]])
+                        await context.bot.send_message(
+                            chat_id=row["user_id"], text=msg, parse_mode="Markdown", reply_markup=kb)
+                        async with (await get_pool()).acquire() as lc:
+                            await lc.execute(
+                                "INSERT INTO alerts_sent (user_id, alert_type, area, detail)"
+                                " VALUES ($1, 'rain_slot', $2, $3)",
+                                row["user_id"], row["area"], slot,
+                            )
+                            await lc.execute(
+                                "INSERT INTO alerts_sent (user_id, alert_type, area, detail)"
+                                " VALUES ($1, 'rain_proximity', $2, $3)",
+                                row["user_id"], row["area"], str(round(max_prob)),
+                            )
+                        print(f"[RAIN ALERT] user={row['user_id']} area={short_area} slot={slot} prob={round(max_prob)}%")
+
+            # ── AQI CHECK — 9:30AM, 1:30PM, 6PM windows ──────────────────
+            if aqi_window and current:
+                slot = _aqi_slot()
+                if slot and slot not in fired_slots:
+                    aqi_val, aqi_cat = None, ""
+                    try:
+                        raw = current["scraped_aqi_value"] or current["us_aqi"]
+                        aqi_val = min(round(float(raw)), 500) if raw else None  # cap at 500
+                        aqi_cat = current["scraped_aqi_category"] or ""
+                    except Exception:
+                        pass
+
+                    if aqi_val and aqi_val > 100:
+                        cat_s = (" (" + aqi_cat + ")") if aqi_cat else ""
+                        if aqi_val > 300:
+                            msg = ("\U0001f6a8 *Hazardous air \u2014 " + short_area + "*\n\n"
+                                   "AQI " + str(aqi_val) + cat_s + "\n"
+                                   "Stay indoors. Keep windows and doors closed.\n"
+                                   "Wear N95 if you must go out.")
+                        elif aqi_val > 200:
+                            msg = ("\U0001f6a8 *Very poor air \u2014 " + short_area + "*\n\n"
+                                   "AQI " + str(aqi_val) + cat_s + "\n"
+                                   "Avoid outdoor activity. Keep windows closed.")
+                        else:
+                            msg = ("\U0001f637 *Unhealthy air \u2014 " + short_area + "*\n\n"
+                                   "AQI " + str(aqi_val) + cat_s + "\n"
+                                   "Sensitive groups should stay indoors.")
+
                         kb = InlineKeyboardMarkup([[
                             InlineKeyboardButton("\U0001f4a1 Full insights", callback_data="insights"),
                         ]])
@@ -3328,10 +3417,59 @@ async def send_rain_proximity_alerts(context: ContextTypes.DEFAULT_TYPE):
                         async with (await get_pool()).acquire() as lc:
                             await lc.execute(
                                 "INSERT INTO alerts_sent (user_id, alert_type, area, detail)"
+                                " VALUES ($1, 'aqi_slot', $2, $3)",
+                                row["user_id"], row["area"], slot,
+                            )
+                            await lc.execute(
+                                "INSERT INTO alerts_sent (user_id, alert_type, area, detail)"
                                 " VALUES ($1, 'aqi_proximity', $2, $3)",
                                 row["user_id"], row["area"], str(aqi_val),
                             )
-                        print(f"[AQI ALERT] user={row['user_id']} area={short_area} aqi={aqi_val}")
+                        print(f"[AQI ALERT] user={row['user_id']} area={short_area} slot={slot} aqi={aqi_val}")
+
+            # ── HEAT CHECK — every hour, 4h cooldown ──────────────────────
+            if near_hourly:
+                last_heat_rec = last_by_type.get("heat_proximity")
+                heat_cooldown_ok = True
+                if last_heat_rec and last_heat_rec["sent_at"]:
+                    age_h = (now - last_heat_rec["sent_at"].replace(tzinfo=None)).total_seconds() / 3600
+                    heat_cooldown_ok = age_h >= 4
+
+                if heat_cooldown_ok:
+                    max_feels  = max((r["apparent_temperature"] or 0) for r in near_hourly)
+                    try:
+                        last_feels = float(last_heat_rec["detail"]) if last_heat_rec and last_heat_rec["detail"] else 0.0
+                    except Exception:
+                        last_feels = 0.0
+
+                    if max_feels >= 32 and (max_feels - last_feels) >= 3:
+                        peak_h_row = max(near_hourly, key=lambda h: h["apparent_temperature"] or 0)
+                        peak_h_ts  = peak_h_row["timestamp"]
+                        peak_h_ts  = peak_h_ts.replace(tzinfo=None) if getattr(peak_h_ts, "tzinfo", None) else peak_h_ts
+                        if peak_h_ts < now:
+                            pass
+                        else:
+                            feels_s = str(round(max_feels, 1))
+                            if max_feels >= 35:
+                                msg = ("\U0001f525 *Dangerous heat \u2014 " + short_area + "*\n\n"
+                                       "Feels like " + feels_s + "\u00b0C right now.\n\n"
+                                       "\u26d4 Stay indoors \u00b7 \U0001f4a7 Water every 20 min \u00b7 \U0001f9f4 SPF 50+")
+                            else:
+                                msg = ("\U0001f321\ufe0f *Getting hot \u2014 " + short_area + "*\n\n"
+                                       "Feels like " + feels_s + "\u00b0C.\n"
+                                       "\U0001f4a7 Stay hydrated and apply SPF 50+ if heading out.")
+                            kb = InlineKeyboardMarkup([[
+                                InlineKeyboardButton("\U0001f4a1 Today's insights", callback_data="insights"),
+                            ]])
+                            await context.bot.send_message(
+                                chat_id=row["user_id"], text=msg, parse_mode="Markdown", reply_markup=kb)
+                            async with (await get_pool()).acquire() as lc:
+                                await lc.execute(
+                                    "INSERT INTO alerts_sent (user_id, alert_type, area, detail)"
+                                    " VALUES ($1, 'heat_proximity', $2, $3)",
+                                    row["user_id"], row["area"], str(round(max_feels, 1)),
+                                )
+                            print(f"[HEAT ALERT] user={row['user_id']} area={short_area} feels={round(max_feels,1)}C")
 
         except Exception as e:
             print(f"[ERROR - proximity user={row['user_id']}] {e}")

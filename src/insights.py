@@ -973,7 +973,10 @@ async def generate_temp_chart(user_id: int, area: str):
         today = _today_ist()
         now   = _now_ist()
 
-        # Fetch next 6 hours from now — spans midnight if needed
+        # Fetch from 30min ago through next 6h — gives visual context before "now"
+        # so the current point isn't jammed against the left edge of the chart
+        from datetime import timedelta as _td
+        fetch_from = now - _td(minutes=30)
         rows = await conn.fetch(
             """
             SELECT timestamp, apparent_temperature, temperature_2m,
@@ -981,11 +984,11 @@ async def generate_temp_chart(user_id: int, area: str):
             FROM hourly_weather
             WHERE run_id = $1
               AND timestamp >= $2
-              AND timestamp < $2 + INTERVAL '6 hours'
+              AND timestamp < $3
             ORDER BY timestamp ASC
-            LIMIT 6
+            LIMIT 8
             """,
-            run_id, now
+            run_id, fetch_from, now + _td(hours=6)
         )
         daily = await conn.fetchrow(
             """
@@ -1142,10 +1145,12 @@ async def generate_temp_chart(user_id: int, area: str):
                     draw.line([(xm, PAD_T), (xm, PAD_T + ch)], fill=col, width=1)
                     draw.text((xm, PAD_T - 4), label, font=f_small, fill=col, anchor="mm")
 
-    # "Now" marker — always at x_pos(0) since index 0 IS the current hour
-    now_x = PAD_L  # index 0 = leftmost bar = now
-    draw.line([(now_x, PAD_T), (now_x, PAD_T + ch)], fill=NOW_C, width=2)
-    draw.text((now_x, PAD_T + ch + 32), "now", font=f_small, fill=NOW_C, anchor="mm")
+    # "Now" marker — position based on actual current time within the window
+    # (window now starts 30min before now, so "now" is slightly right of left edge)
+    now_x = _dt_to_x(now)
+    if now_x is not None:
+        draw.line([(now_x, PAD_T), (now_x, PAD_T + ch)], fill=NOW_C, width=2)
+        draw.text((now_x, PAD_T + ch + 32), "now", font=f_small, fill=NOW_C, anchor="mm")
 
     # Draw filled area under the line
     poly_pts = [(PAD_L, PAD_T + ch)]
@@ -1175,11 +1180,17 @@ async def generate_temp_chart(user_id: int, area: str):
         x2, y2 = x_pos(i+1), y_pos(t2)
         draw.line([(x1, y1), (x2, y2)], fill=col, width=3)
 
-    # Dot at current hour — always index 0 (leftmost) since we fetch from now
+    # Dot at the hour closest to now
+    closest_i = 0
     if hours:
-        ct = hours[0].get("apparent_temperature")
+        def _ts_naive(ts):
+            return ts.replace(tzinfo=None) if getattr(ts, "tzinfo", None) else ts
+        diffs = [abs((_ts_naive(h["timestamp"]) - now).total_seconds()) for h in hours if h.get("timestamp")]
+        closest_i = diffs.index(min(diffs)) if diffs else 0
+    if hours:
+        ct = hours[closest_i].get("apparent_temperature")
         if ct is not None:
-            cx, cy = x_pos(0), y_pos(ct)
+            cx, cy = x_pos(closest_i), y_pos(ct)
             col = temp_color(ct)
             draw.ellipse([cx-6, cy-6, cx+6, cy+6], fill=col, outline=WHITE, width=2)
             draw.text((cx, cy - 16), f"{round(ct)}°C", font=f_label, fill=col, anchor="mm")
